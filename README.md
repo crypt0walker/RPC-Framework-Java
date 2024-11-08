@@ -183,7 +183,7 @@
 
 ## 1.5 整体代码结构
 
-![simple_RPC](H:\Java\project\RPC-java\simple_RPC\simple_RPC.png)
+![simple_RPC](./images/simple_RPC.png)
 
 ### 1.5.1 **com.async.rpc 包结构**
 
@@ -394,7 +394,7 @@ Netty 是一个基于 Java 的高性能、异步的网络应用框架，广泛�
 
 - 以Netty的方式实现RpcClient接口
 
-  <img src="./C:/Users/16232/AppData/Roaming/Typora/typora-user-images/image-20241108215119277.png" alt="image-20241108215119277" style="zoom:50%;" />
+  <img src="./images/image-20241108215119277.png" alt="image-20241108215119277" style="zoom:50%;" />
 
   - 这里我们做了优化，同时实现了一个简单Socket类型的对RpcClient接口的实现，以方便客户端选择使用那种类型（choose字段）
   - 由于以上，所以同时也需要对ClientProxy进行重构，更改构造方法以及消息处理的写法（见后续）
@@ -407,7 +407,7 @@ Netty 是一个基于 Java 的高性能、异步的网络应用框架，广泛�
 
 这一步的目的是重写原位于ClientProxy中invoke方法内的
 
-<img src="./C:/Users/16232/AppData/Roaming/Typora/typora-user-images/image-20241108215533427.png" alt="image-20241108215533427" style="zoom:50%;" />
+<img src="./images/image-20241108215533427.png" alt="image-20241108215533427" style="zoom:50%;" />
 
 首先对传输的类定义接口RpcClient
 
