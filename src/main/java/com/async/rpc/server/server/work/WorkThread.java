@@ -1,4 +1,4 @@
-package com.async.rpc.server.work;
+package com.async.rpc.server.server.work;
 /**
  * @author async
  * @github crypt0walker

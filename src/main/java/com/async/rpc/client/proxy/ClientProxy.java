@@ -6,6 +6,9 @@ package com.async.rpc.client.proxy;
  */
 
 import com.async.rpc.client.IOClient;
+import com.async.rpc.client.rpcClient.RpcClient;
+import com.async.rpc.client.rpcClient.impl.NettyRpcClient;
+import com.async.rpc.client.rpcClient.impl.SimpleSocketRpcCilent;
 import com.async.rpc.common.message.RpcRequest;
 import com.async.rpc.common.message.RpcResponse;
 import lombok.AllArgsConstructor;
@@ -21,28 +24,35 @@ import java.lang.reflect.Proxy;
  **/
 @AllArgsConstructor
 public class ClientProxy implements InvocationHandler {
-    // 服务器主机地址
-    private String host;
-    // 服务器端口
-    private int port;
-
-    // JDK动态代理，每一次代理对象调用方法时，都会经过此方法进行增强
+//    // 服务器主机地址
+//    private String host;
+//    // 服务器端口
+//    private int port;
+    private RpcClient rpcClient;
+    public ClientProxy(String host,int port,int choose){
+        switch (choose){
+            case 0:
+                rpcClient=new NettyRpcClient(host,port);
+                break;
+            case 1:
+                rpcClient=new SimpleSocketRpcCilent(host,port);
+        }
+    }
+    public ClientProxy(String host,int port){
+        rpcClient=new NettyRpcClient(host,port);
+    }
+    //jdk动态代理，每一次代理对象调用方法，都会经过此方法增强（反射获取request对象，socket发送到服务端）
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-        // 构建RpcRequest对象，封装请求信息
-        RpcRequest request = RpcRequest.builder()
-                .interfaceName(method.getDeclaringClass().getName()) // 获取接口的类名
-                .methodName(method.getName()) // 获取调用的方法名
-                .params(args) // 获取方法参数
-                .paramsType(method.getParameterTypes()) // 获取参数类型
-                .build();
-
-        // 调用IOClient发送请求到服务端，并接收响应
-        RpcResponse response = IOClient.sendRequest(host, port, request);
-        // 返回响应中的数据
+        //构建request
+        RpcRequest request=RpcRequest.builder()
+                .interfaceName(method.getDeclaringClass().getName())
+                .methodName(method.getName())
+                .params(args).paramsType(method.getParameterTypes()).build();
+        //数据传输
+        RpcResponse response= rpcClient.sendRequest(request);
         return response.getData();
     }
-
     // 创建代理实例的方法
     public <T> T getProxy(Class<T> clazz) {
         // 使用Proxy.newProxyInstance创建一个代理实例
@@ -54,4 +64,21 @@ public class ClientProxy implements InvocationHandler {
         // 将Object类型的代理实例强制转换为泛型T并返回
         return (T) o; // 返回代理对象
     }
+    //简单版本的PRC调用，现在用上面的Rpcclent封装做，可以选择用哪种
+//    // JDK动态代理，每一次代理对象调用方法时，都会经过此方法进行增强
+//    @Override
+//    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+//        // 构建RpcRequest对象，封装请求信息
+//        RpcRequest request = RpcRequest.builder()
+//                .interfaceName(method.getDeclaringClass().getName()) // 获取接口的类名
+//                .methodName(method.getName()) // 获取调用的方法名
+//                .params(args) // 获取方法参数
+//                .paramsType(method.getParameterTypes()) // 获取参数类型
+//                .build();
+//
+//        // 调用IOClient发送请求到服务端，并接收响应
+//        RpcResponse response = IOClient.sendRequest(host, port, request);
+//        // 返回响应中的数据
+//        return response.getData();
+//    }
 }
