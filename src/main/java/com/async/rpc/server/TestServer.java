@@ -18,12 +18,12 @@ import com.async.rpc.server.server.RpcServer;
  **/
 public class TestServer {
     public static void main(String[] args) {
-        UserService userService=new UserServiceImpl();
-
-        ServiceProvider serviceProvider=new ServiceProvider();
-        serviceProvider.provideServiceInterface(userService);
-
-        RpcServer rpcServer=new SimpleRpcServerImpl(serviceProvider);
-        rpcServer.start(9999);
+//        UserService userService=new UserServiceImpl();
+//        //其它地方需要改成非zookeeper版本才能运行
+//        ServiceProvider serviceProvider=new ServiceProvider();
+//        serviceProvider.provideServiceInterface(userService);
+//
+//        RpcServer rpcServer=new SimpleRpcServerImpl(serviceProvider);
+//        rpcServer.start(9999);
     }
 }

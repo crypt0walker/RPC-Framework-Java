@@ -47,10 +47,10 @@ public class WorkThread implements Runnable{
         String interfaceName=rpcRequest.getInterfaceName();
         //serviceProvide提供了可提供服务的Map，所以先获取rpcRequest中的接口名，以得到服务端相应服务实现类
         Object service = serviceProvide.getService(interfaceName);
-        //反射调用方法
+        //反射调用方法，Method类是反射API中内置的类，相似的还有Class，Field，Constructor等
         Method method=null;
         try {
-            //获取方法？
+            //通过 Method 对象获取方法的名称、返回类型、参数类型、修饰符等详细信息。
             method= service.getClass().getMethod(rpcRequest.getMethodName(), rpcRequest.getParamsType());
             Object invoke=method.invoke(service,rpcRequest.getParams());
             return RpcResponse.sussess(invoke);

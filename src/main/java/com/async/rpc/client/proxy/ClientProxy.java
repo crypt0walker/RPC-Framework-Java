@@ -28,6 +28,12 @@ public class ClientProxy implements InvocationHandler {
 //    private String host;
 //    // 服务器端口
 //    private int port;
+    /* 非netty版本：直接用java原生
+    public ClientProxy(String host,int port){
+        rpcClient=new NettyRpcClient(host,port);
+    }
+     */
+    /* Netty版本（非zookeeper）:采用写死的端口号和ip
     private RpcClient rpcClient;
     public ClientProxy(String host,int port,int choose){
         switch (choose){
@@ -38,9 +44,13 @@ public class ClientProxy implements InvocationHandler {
                 rpcClient=new SimpleSocketRpcCilent(host,port);
         }
     }
-    public ClientProxy(String host,int port){
-        rpcClient=new NettyRpcClient(host,port);
+     */
+    private RpcClient rpcClient;
+    public ClientProxy(){
+        rpcClient=new NettyRpcClient();
     }
+
+
     //jdk动态代理，每一次代理对象调用方法，都会经过此方法增强（反射获取request对象，socket发送到服务端）
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
@@ -62,9 +72,9 @@ public class ClientProxy implements InvocationHandler {
         Object o = Proxy.newProxyInstance(clazz.getClassLoader(), new Class[]{clazz}, this);
 
         // 将Object类型的代理实例强制转换为泛型T并返回
-        return (T) o; // 返回代理对象
+        return (T)o; // 返回代理对象
     }
-    //简单版本的PRC调用，现在用上面的Rpcclent封装做，可以选择用哪种
+    /* 简单版本的PRC调用（非Netty）：Netty版本用了Rpcclent封装，可以选择用哪种——Netty还是Java原生
 //    // JDK动态代理，每一次代理对象调用方法时，都会经过此方法进行增强
 //    @Override
 //    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
@@ -81,4 +91,5 @@ public class ClientProxy implements InvocationHandler {
 //        // 返回响应中的数据
 //        return response.getData();
 //    }
+     */
 }

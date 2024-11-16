@@ -7,6 +7,8 @@ package com.async.rpc.client.rpcClient.impl;
 
 import com.async.rpc.client.netty.nettyInitializer.NettyClientInitializer;
 import com.async.rpc.client.rpcClient.RpcClient;
+import com.async.rpc.client.serviceCenter.ServiceCenter;
+import com.async.rpc.client.serviceCenter.ZKServiceCenter;
 import com.async.rpc.common.message.RpcRequest;
 import com.async.rpc.common.message.RpcResponse;
 import io.netty.bootstrap.Bootstrap;
@@ -16,6 +18,8 @@ import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.AttributeKey;
+
+import java.net.InetSocketAddress;
 
 /**
  * @program: simple_RPC
@@ -30,10 +34,21 @@ public class NettyRpcClient implements RpcClient {
     // 事件循环组，用于处理网络事件
     //EventLoopGroup是Netty的channel包组件，用于处理所有IO操作的线程池组，提供包括NIO、epoll、BIO等不同模型。
     private static final EventLoopGroup eventLoopGroup;
+    /* Netty版本（非zookeeper）：将ip与端口写死
     public NettyRpcClient(String host,int port){
         this.host=host;
         this.port=port;
     }
+     */
+    // zookeeper版本：先去注册中心查找服务对应的ip和端口，再去连接对应服务器
+    private ServiceCenter serviceCenter;
+    public NettyRpcClient(){
+        this.serviceCenter=new ZKServiceCenter();
+    }
+
+
+
+
     //netty客户端初始化
     static {
         // 创建一个 NIO 事件循环组
@@ -49,6 +64,12 @@ public class NettyRpcClient implements RpcClient {
 
     @Override
     public RpcResponse sendRequest(RpcRequest request) {
+        //zookeeper补充，否则无host
+        //从注册中心获取对应服务名的host,post
+        InetSocketAddress address = serviceCenter.serviceDiscovery(request.getInterfaceName());
+        String host = address.getHostName();
+        int port = address.getPort();
+        //zookeeper版本
         try {
             //创建一个channelFuture对象用于监控操作执行情况，代表这一个操作事件，sync方法表示阻塞直到connect完成
             ChannelFuture channelFuture  = bootstrap.connect(host, port).sync();

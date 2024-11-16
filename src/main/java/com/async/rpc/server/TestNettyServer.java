@@ -13,16 +13,16 @@ import com.async.rpc.server.server.RpcServer;
 /**
  * @program: simple_RPC
  *
- * @description: netty测试类
+ * @description: netty测试类（非zookeeper版本）
  **/
 public class TestNettyServer {
-    public static void main(String[] args) {
-        UserServiceImpl userService = new UserServiceImpl();
-
-        ServiceProvider serviceProvider = new ServiceProvider();
-        serviceProvider.provideServiceInterface(userService);
-
-        RpcServer rpcServer = new NettyRpcServerImpl(serviceProvider);
-        rpcServer.start(9999);
-    }
+//    public static void main(String[] args) {
+//        UserServiceImpl userService = new UserServiceImpl();
+//        //其它地方需要改成非zookeeper版本才能运行
+//        ServiceProvider serviceProvider = new ServiceProvider();
+//        serviceProvider.provideServiceInterface(userService);
+//
+//        RpcServer rpcServer = new NettyRpcServerImpl(serviceProvider);
+//        rpcServer.start(9999);
+//    }
 }

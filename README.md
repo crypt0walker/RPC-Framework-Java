@@ -4,6 +4,10 @@
 
 - 构建一个基本的RPC调用——√
 - 引入Netty网络应用框架——√
+- 引入Zookeeper作为服务注册中心——√
+- Netty自定义编码器、解码器及序列化器，实现json、protobuf序列化方式——待完成
+- 客户端建立本地服务缓存并实现动态更新——待完成
+- ……
 
 # 1. 实现一个基本的RPC调用
 
@@ -1038,5 +1042,915 @@ protected void channelRead0(ChannelHandlerContext ctx, RpcResponse response) {
 
 
 
+# 3. 引入zookeeper作为注册中心
 
+## 3.1 Zookeeper相关知识
+
+### Zookeeper 简介
+
+**Zookeeper** 是一个开源的分布式协调服务，主要用于管理分布式应用中的配置信息、命名服务和分布式同步。它可以看作是一个高性能、高可靠的分布式数据库，专门设计用于存储和管理小型数据，比如配置信息、元数据等。
+
+#### **Zookeeper 的主要特点**
+
+1. **分布式一致性**：使用 **ZAB（Zookeeper Atomic Broadcast）协议**，确保多台 Zookeeper 节点之间的数据一致性。
+2. **高性能**：通过内存存储，快速响应读请求，尤其适用于读多写少的场景。
+3. **高可用性**：通常部署为一个由多台服务器组成的集群，只要超过一半的节点存活，整个集群就能正常工作。
+4. **顺序访问**：为所有事务操作分配唯一递增的事务 ID（zxid），保证了操作的全局顺序。
+
+#### **Zookeeper 的数据模型**
+
+Zookeeper 的数据模型类似于文件系统，每个节点（称为 **znode**）可以存储数据和子节点，构成一棵树状结构。
+
+---
+
+### Zookeeper 在 RPC 中的作用
+
+在 RPC 框架中，Zookeeper 通常作为**注册中心**使用，主要解决分布式环境下服务管理的问题。它的核心作用如下：
+
+#### 1. **服务注册与发现**
+
+   - **服务端注册服务**：
+     当服务端启动时，将自己的服务信息（例如服务名称、IP 地址和端口号）注册到 Zookeeper 中的特定节点。
+   - **客户端发现服务**：
+     客户端调用服务前，会从 Zookeeper 中获取服务端的地址和端口，然后直接与服务端建立连接。
+
+#### 2. **动态管理服务列表**
+
+   - 当一个服务实例下线或不可用时，Zookeeper 会通过临时节点的机制自动移除该服务信息，客户端可以实时更新服务列表，避免调用无效服务。
+
+#### 3. **负载均衡**
+
+   - 客户端可以从 Zookeeper 获取所有可用服务的列表，并通过某种负载均衡算法（如随机、轮询等）选择一个实例进行调用。
+
+#### 4. **高可用性**
+
+   - Zookeeper 作为分布式注册中心，具备高可用性，即使部分节点故障，也不会影响注册和发现的功能。
+
+---
+
+### Zookeeper 在 RPC 中的具体工作流程
+
+#### 1. **服务端启动时**
+
+   - 服务端启动后，向 Zookeeper 注册中心注册服务信息，通常以 **服务名** 作为 Znode 的路径，以 **服务地址（IP+端口）** 作为节点数据存储。
+
+   例如，注册的 Zookeeper 节点结构：
+
+   ```
+/services
+    /UserService
+        192.168.1.100:8080
+        192.168.1.101:8081
+   ```
+
+#### 2. **客户端调用时**
+
+   - 客户端首先从 Zookeeper 获取目标服务（如 `UserService`）的地址列表。
+   - 根据负载均衡策略选定一个地址，建立网络连接并发送 RPC 请求。
+
+#### 3. **服务实例变化时**
+
+   - 如果某个服务实例下线，Zookeeper 会删除对应的临时节点。
+   - 客户端监听 Zookeeper 节点的变化事件，并实时更新服务列表。
+
+---
+
+### 为什么引入 Zookeeper？
+
+1. **解决服务动态变化的问题**：
+   - 通过 Zookeeper 实现服务的动态注册与发现，客户端无需硬编码服务地址，避免服务上下线导致的问题。
+
+2. **提高系统的扩展性**：
+   - 新增服务只需注册到 Zookeeper，客户端会自动感知，无需手动配置。
+
+3. **降低系统耦合性**：
+   - 客户端与服务端通过 Zookeeper 解耦，直接通过服务名访问，而非依赖固定地址。
+
+4. **保障服务高可用性**：
+   - Zookeeper 提供可靠的节点管理，避免了因单点故障导致服务不可用的问题。
+
+
+
+## 3.2 客户端重构
+
+引入zookeeper后最大的不同就在于无需在代码中硬编码所需服务的IP与端口号，而是构建一个服务发现中心，用于向zk注册中心发起请求查询所需服务的IP地址与端口号；相应的原代码中硬编码的IP地址与端口号也需要相应的更改；
+
+### 环境配置
+
+引入Curator包：对zookeeper进行连接操作的工具
+
+```xml
+<!--这个jar包应该依赖log4j,不引入log4j会有控制台会有warn，但不影响正常使用-->
+<dependency>
+    <groupId>org.apache.curator</groupId>
+    <artifactId>curator-recipes</artifactId>
+    <version>5.1.0</version>
+</dependency>
+```
+
+启动Zookeeper服务器：
+
+管理员权限启动CMD，执行以下命令开启zookeeper服务器（需要提前设置好环境变量）
+
+```cmd
+zkServer
+```
+
+### 修改ClientProxy
+
+简介——接触IP与端口的硬编码
+
+```java
+    //……以上不改变部分省略
+	//重写无参构造函数，原写法中在构造函数中就写入IP与端口号
+	private RpcClient rpcClient;
+    public ClientProxy(){
+        rpcClient=new NettyRpcClient();
+    }
+```
+
+### 修改nettyRpcClient
+
+简介——解除硬编码，并在sendRequest中先去注册中心查找对应服务的ip和端口号再去连接服务器
+
+```java
+    //……省略其它
+	/* Netty版本（非zookeeper）：将ip与端口写死
+    public NettyRpcClient(String host,int port){
+        this.host=host;
+        this.port=port;
+    }
+     */
+    // zookeeper版本：先去注册中心查找服务对应的ip和端口，再去连接对应服务器
+    private ServiceCenter serviceCenter;
+    public NettyRpcClient(){
+        this.serviceCenter=new ZKServiceCenter();
+    }
+
+    @Override
+    public RpcResponse sendRequest(RpcRequest request) {
+        //zookeeper补充，否则无host
+        //从注册中心获取对应服务名的host,post
+        InetSocketAddress address = serviceCenter.serviceDiscovery(request.getInterfaceName());
+        String host = address.getHostName();
+        int port = address.getPort();
+        //zookeeper版本
+        try {
+            //创建一个channelFuture对象用于监控操作执行情况，代表这一个操作事件，sync方法表示阻塞直到connect完成
+            ChannelFuture channelFuture  = bootstrap.connect(host, port).sync();
+            //channel表示一个连接的单位，类似socket
+            Channel channel = channelFuture.channel();
+            // 通过channel发送数据
+            channel.writeAndFlush(request);
+            // sync() 等待通道关闭，确保数据完全发送
+            channel.closeFuture().sync();
+            // 阻塞的获得结果，通过给channel设计别名，获取特定名字下的channel中的内容（这个在handlder中设置）
+            // AttributeKey是，线程隔离的，不会由线程安全问题。
+            // 当前场景下选择堵塞获取结果
+            // 其它场景也可以选择添加监听器的方式来异步获取结果 channelFuture.addListener...
+            // 使用 AttributeKey 从通道的上下文中获取响应数据
+            AttributeKey<RpcResponse> key = AttributeKey.valueOf("RPCResponse");
+            // 获取存储在通道属性中的响应对象
+            RpcResponse response = channel.attr(key).get();
+            System.out.println(response);
+            return response;
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+	
+```
+
+### 注册中心类
+
+#### ServiceCenter接口
+
+简介——定义服务中心接口
+
+```java
+//服务中心接口
+public interface ServiceCenter {
+    //  查询：根据服务名查找地址
+    InetSocketAddress serviceDiscovery(String serviceName);
+}
+
+```
+
+#### ZKServiceCenter类
+
+简介——与ZK服务器建立连接并获取相应服务接口
+
+`ZKServiceCenter` 是一个基于 **Zookeeper** 的服务注册中心实现，用于实现 **服务发现功能**。客户端通过此类从 Zookeeper 中查询可用的服务地址，返回 `InetSocketAddress` 供客户端连接使用。
+
+```java
+package com.async.rpc.client.serviceCenter;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/15
+ */
+
+import org.apache.curator.RetryPolicy;
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.retry.ExponentialBackoffRetry;
+
+import java.net.InetSocketAddress;
+import java.util.List;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: zookeeper注册中心
+ **/
+public class ZKServiceCenter implements ServiceCenter {
+    // curator 提供的zookeeper客户端,是用来与 Zookeeper 服务器通信的核心对象。
+    private CuratorFramework client;
+    //定义 Zookeeper 中的根节点路径，所有的服务都注册在这个路径下。
+    private static final String ROOT_PATH = "MyRPC";
+
+    //构造函数：负责zookeeper客户端的初始化，并与zookeeper服务端进行连接
+    public ZKServiceCenter(){
+        // 创建重试策略：指数退避重试
+        RetryPolicy policy = new ExponentialBackoffRetry(1000, 3);
+        // zookeeper的地址固定，不管是服务提供者还是消费者都要与之建立连接
+        // sessionTimeoutMs 与 zoo.cfg中的tickTime 有关系，
+        // zk还会根据minSessionTimeout与maxSessionTimeout两个参数重新调整最后的超时值。默认分别为tickTime 的2倍和20倍
+        // 初始化 Zookeeper 客户端
+        this.client = CuratorFrameworkFactory.builder()
+                .connectString("127.0.0.1:2181") // Zookeeper 服务器的地址,可以是单个或多个 IP+端口
+                .sessionTimeoutMs(40000)        // 会话超时时间，40秒,心跳监听状态超时未响应将失效
+                .retryPolicy(policy)            // 设置重试策略
+                .namespace(ROOT_PATH)           // 设置根路径（命名空间），操作时所有路径都以这个为前缀
+                .build();
+        this.client.start();
+        System.out.println("zookeeper 连接成功");
+    }
+    //服务发现方法
+    //向zk注册中心发起查询，根据服务名（接口名）返回地址
+    @Override
+    public InetSocketAddress serviceDiscovery(String serviceName) {
+        try {
+            // 获取 Zookeeper 中指定服务名称的子节点列表
+            //客户端通过服务名 serviceName 向 Zookeeper 查询注册的服务实例列表。
+            //返回结果是一个服务实例的地址（如 192.168.1.100:8080）。
+            List<String> strings = client.getChildren().forPath("/" + serviceName);
+
+            // 检查列表是否为空——如果不检查若列表为空，后续get(0)则会报异常
+            if (strings == null || strings.isEmpty()) {
+                System.err.println("No available instances for service: " + serviceName);
+                return null; // 或者你可以抛出一个自定义的异常来告知调用者
+            }
+
+            // 选择一个服务实例，默认用第一个节点，后续可以加入负载均衡机制
+            String string = strings.get(0);
+
+            // 解析并返回 InetSocketAddress
+            // 将字符串形式的地址（如 192.168.1.100:8080）转换为 InetSocketAddress，便于后续网络连接。
+            return parseAddress(string);
+        } catch (Exception e) {
+            e.printStackTrace(); // 打印异常堆栈
+            return null; // 或者根据需求返回一个默认的 InetSocketAddress
+        }
+    }
+
+    // 地址 -> XXX.XXX.XXX.XXX:port 字符串
+    //将 InetSocketAddress 对象转换为字符串形式 IP:Port，便于存储到 Zookeeper。
+    private String getServiceAddress(InetSocketAddress serverAddress) {
+        return serverAddress.getHostName() +
+                ":" +
+                serverAddress.getPort();
+    }
+    
+    // 字符串解析为地址
+    //将 IP:Port 字符串解析为 InetSocketAddress，便于客户端与服务端建立网络连接。
+    private InetSocketAddress parseAddress(String address) {
+        String[] result = address.split(":"); // 按 `:` 分割 IP 和端口
+        return new InetSocketAddress(result[0], Integer.parseInt(result[1]));
+    }
+}
+```
+
+### 测试函数
+
+```java
+package com.async.rpc.client;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/15
+ */
+
+import com.async.rpc.client.proxy.ClientProxy;
+import com.async.rpc.common.pojo.User;
+import com.async.rpc.common.server.UserService;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: ZK注册中心版本测试类
+ **/
+public class TestZKClient {
+    public static void main(String[] args) {
+        ClientProxy clientProxy=new ClientProxy();
+        //ClientProxy clientProxy=new part2.Client.proxy.ClientProxy("127.0.0.1",9999,0);
+        UserService proxy=clientProxy.getProxy(UserService.class);
+
+        User user = proxy.getUserByUserId(1);
+        System.out.println("从服务端得到的user="+user.toString());
+
+        User u=User.builder().id(100).userName("wxx").gender(true).build();
+        Integer id = proxy.insertUserId(u);
+        System.out.println("向服务端插入user的id"+id);
+    }
+}
+```
+
+#### 客户端调用
+
+1. **`TestZKClient.main()`**
+   客户端入口。调用主函数，创建 `ClientProxy` 实例，并通过动态代理对象调用服务接口方法，例如 `proxy.getUserByUserId(1)`。
+2. **`ClientProxy.getProxy()`**
+   使用 JDK 动态代理，生成服务接口（如 `UserService`）的代理对象。
+   **作用**：当调用代理对象方法时，会转发到 `ClientProxy.invoke()`。
+3. **`ClientProxy.invoke()`**
+   捕获代理对象方法的调用，将方法名、参数等封装为 `RpcRequest` 对象。
+   调用 `NettyRpcClient.sendRequest()`，发送请求到服务端。
+4. **`NettyRpcClient.sendRequest()`**
+   1. 调用 `ZKServiceCenter.serviceDiscovery()`，从 Zookeeper 获取目标服务的 IP 和端口。
+   2. 使用 Netty 建立通道，序列化 `RpcRequest` 对象并发送到服务端。
+   3. 等待服务端返回响应。
+5. **`ZKServiceCenter.serviceDiscovery()`**
+   查询 Zookeeper，获取服务名对应的子节点列表（即服务实例地址）。
+   返回第一个服务地址（可扩展为负载均衡策略）。
+6. **`NettyClientHandler.channelRead0()`**
+   客户端接收到服务端响应时触发。
+   将反序列化后的 `RpcResponse` 对象存储在通道的属性中，供 `NettyRpcClient.sendRequest()` 使用。
+7. **返回响应到客户端**
+   `NettyRpcClient.sendRequest()` 返回 `RpcResponse` 的数据部分到 `ClientProxy.invoke()`，最终返回给 `TestZKClient.main()`。
+
+#### 服务端接收
+
+1. **`SimpleRpcServerImpl.start()`**
+   服务端入口。启动 Netty 服务器，监听指定端口。
+   为每个客户端连接分配通道，并通过 `NettyServerInitializer` 配置解码器和业务处理器。
+2. **`NettyRPCServerHandler.channelRead0()`**
+   服务端接收到客户端请求时触发。
+   将字节流反序列化为 `RpcRequest` 对象，并调用 `getResponse()` 处理业务逻辑。
+3. **`getResponse()`**
+   通过反射机制，根据 `RpcRequest` 中的方法名、参数类型、参数值，调用对应的服务实现类（如 `UserServiceImpl`）的方法。
+   返回调用结果，封装为 `RpcResponse` 对象。
+4. **`UserServiceImpl.getUserByUserId()`**
+   实现服务的具体逻辑。例如，模拟从数据库中查询用户数据并返回。
+5. **返回响应到客户端**
+   服务端将 `RpcResponse` 对象序列化后写回客户端。
+   客户端接收后解码并返回给调用方。
+
+#### 交互概览
+
+```
+客户端调用:
+TestZKClient.main()
+    --> ClientProxy.getProxy()
+    --> ClientProxy.invoke()
+    --> NettyRpcClient.sendRequest()
+        --> ZKServiceCenter.serviceDiscovery()
+        --> NettyClientHandler.channelRead0()
+    --> 返回响应到客户端
+
+服务端接收:
+SimpleRpcServerImpl.start()
+    --> NettyRPCServerHandler.channelRead0()
+    --> getResponse()
+        --> UserServiceImpl.getUserByUserId()
+    --> 返回响应到客户端
+
+```
+
+## 3.3 服务端重构
+
+服务端引入Zookeeper之后需要做的改动主要是需要进行服务注册，同时也需要与zookeeper服务器建立连接，因为其与客户端一样同样也是zk注册中心的客户端；所以需要修改ServerProvider（原功能是注册服务到本地集合）
+
+### 修改ServiceProvider
+
+简介——由将服务注册至本地改位将服务名与服务实例的网络地址（IP:Port）注册到Zookeeper注册中心，使客户端能够动态发现服务；
+
+**类功能概述**
+
+`ServiceProvider` 是服务端用于管理服务的核心类，其主要职责包括：
+
+1. 本地服务管理：
+   - 将服务对象存储到一个本地的 `HashMap` 中，供服务端在接收到客户端请求时快速找到对应的服务实现类。
+2. 服务注册：
+   - 如果使用 **Zookeeper**，将服务名和服务实例的网络地址（`IP:Port`）注册到 Zookeeper 注册中心，使客户端能够动态发现服务。
+3. 获取服务实例：
+   - 提供根据服务名查找对应服务实例的方法，用于服务端调用具体的业务逻辑。
+
+```java
+package com.async.rpc.server.provider;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/3
+ */
+
+import com.async.rpc.server.serviceRegister.ServiceRegister;
+import com.async.rpc.server.serviceRegister.impl.ZKServiceRegister;
+import lombok.AllArgsConstructor;
+
+import java.net.InetSocketAddress;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: 本地服务存放器
+ **/
+//本地服务存放器
+public class ServiceProvider {
+    //集合中存放本地服务的实例
+    // 使用 HashMap 将服务接口名（String）与对应服务实例对象（Object）映射起来，供服务端查找服务时使用。
+    private Map<String,Object> interfaceProvider;
+
+    /*非zookeeper版本：本地注册服务
+    public ServiceProvider(){
+        this.interfaceProvider=new HashMap<>();
+    }
+    //本地注册服务
+    public void provideServiceInterface(Object service){
+        String serviceName=service.getClass().getName();
+        Class<?>[] interfaceName=service.getClass().getInterfaces();
+
+        for (Class<?> clazz:interfaceName){
+            interfaceProvider.put(clazz.getName(),service);
+        }
+
+    }
+     */
+
+    //zookeeper注册服务
+    private int port;
+    private String host;
+    //注册服务类
+    private ServiceRegister serviceRegister;
+
+    public ServiceProvider(String host, int port) {
+        // 服务端的 IP 和端口，用于标识服务实例的位置
+        this.host = host;
+        this.port = port;
+
+        // 初始化本地服务存储器，使用 HashMap 存储服务名到服务实例的映射
+        this.interfaceProvider = new HashMap<>();
+
+        // 初始化 Zookeeper 服务注册器
+        this.serviceRegister = new ZKServiceRegister();
+    }
+    
+    //在测试类中调用“serviceProvider.provideServiceInterface(userService);”
+    //传入一个服务实例
+    public void provideServiceInterface(Object service) {
+        // 获取服务的类名（完整路径）
+        String serviceName = service.getClass().getName();
+
+        // 获取服务实现类所实现的接口列表
+        Class<?>[] interfaceName = service.getClass().getInterfaces();
+
+        // 遍历接口列表
+        for (Class<?> clazz : interfaceName) {
+            // 1. 将服务接口名和服务实例对象保存到本地的映射表中
+            // 服务端可以快速找到实现类以处理具体业务逻辑。
+            interfaceProvider.put(clazz.getName(), service);
+
+            // 2. 将服务名和网络地址注册到 Zookeeper 中
+            // 客户端可以动态发现服务的 IP 和端口，避免硬编码。
+            serviceRegister.register(clazz.getName(), new InetSocketAddress(host, port));
+        }
+    }
+    //获取服务实例
+    //从本地存储的 interfaceProvider 映射中，根据接口名查找对应的服务实例。
+    //使用场景：当服务端接收到客户端的请求时，通过接口名查找对应的服务实现类，然后通过反射调用具体方法。
+    public Object getService(String interfaceName){
+        return interfaceProvider.get(interfaceName);
+    }
+}
+
+
+```
+
+逻辑关系
+
+```
+TestZKServer.main()
+    --> 初始化服务实现类 UserServiceImpl
+    --> 初始化 ServiceProvider
+    --> 调用 ServiceProvider.provideServiceInterface()
+        --> 本地存储服务映射 (interfaceProvider.put)
+        --> 注册服务到 Zookeeper (serviceRegister.register)
+    --> 启动 RpcServer
+
+```
+
+### 实现服务注册接口与类
+
+#### 服务注册接口—ServiceRegister
+
+```java
+package com.async.rpc.server.serviceRegister;
+
+import java.net.InetSocketAddress;
+
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/15
+ */
+public interface ServiceRegister {
+    //  注册：保存服务与地址。
+    void register(String serviceName, InetSocketAddress serviceAddress);
+}
+
+```
+
+#### 服务注册实现类—ZKServiceRegisterImpl
+
+**类功能概述**
+
+`ZKServiceRegister` 是服务端用于与 **Zookeeper 注册中心** 交互的实现类，实现了 `ServiceRegister` 接口，主要职责是：
+
+1. 初始化 Zookeeper 客户端：
+   - 与 Zookeeper 服务端建立连接。
+2. 注册服务：
+   - 在 Zookeeper 中创建服务名节点，并为每个服务实例添加地址子节点。
+   - 服务实例节点使用临时节点，服务端下线时自动删除。
+
+```java
+package com.async.rpc.server.serviceRegister.impl;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/15
+ */
+
+import com.async.rpc.server.serviceRegister.ServiceRegister;
+import org.apache.curator.RetryPolicy;
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.retry.ExponentialBackoffRetry;
+import org.apache.zookeeper.CreateMode;
+
+import java.net.InetSocketAddress;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: 向ZK注册中心注册服务
+ **/
+public class ZKServiceRegister implements ServiceRegister {
+    // curator 提供的zookeeper客户端
+    private CuratorFramework client;
+    //zookeeper根路径节点
+    private static final String ROOT_PATH = "MyRPC";
+
+    //构造函数：负责zookeeper客户端的初始化，并与zookeeper服务端进行连接，同client一致
+    public ZKServiceRegister(){
+        // 指数时间重试
+        RetryPolicy policy = new ExponentialBackoffRetry(1000, 3);
+        // zookeeper的地址固定，不管是服务提供者还是，消费者都要与之建立连接
+        // sessionTimeoutMs 与 zoo.cfg中的tickTime 有关系，
+        // zk还会根据minSessionTimeout与maxSessionTimeout两个参数重新调整最后的超时值。默认分别为tickTime 的2倍和20倍
+        // 使用心跳监听状态
+        this.client = CuratorFrameworkFactory.builder().connectString("127.0.0.1:2181")
+                .sessionTimeoutMs(40000).retryPolicy(policy).namespace(ROOT_PATH).build();
+        this.client.start();
+        System.out.println("zookeeper 连接成功");
+    }
+
+
+    @Override
+    public void register(String serviceName, InetSocketAddress serviceAddress) {
+        try {
+            // 检查服务名节点是否存在，不存在则创建永久节点   
+            // serviceName创建成永久节点，服务提供者下线时，不删服务名，只删地址
+            // 永久节点通常用于表示一个服务的逻辑名称，例如 /MyRPC/UserService。
+            // 服务名称是长期存在的，即使所有服务实例都暂时不可用，服务的逻辑概念仍然保留。
+            if(client.checkExists().forPath("/" + serviceName) == null){
+                client.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath("/" + serviceName);
+            }
+            // 路径地址，一个/代表一个节点,属于临时节点（因为是具体的服务地址）
+            String path = "/" + serviceName +"/"+ getServiceAddress(serviceAddress);
+            // 临时节点，服务器下线就删除节点
+            client.create().creatingParentsIfNeeded().withMode(CreateMode.EPHEMERAL).forPath(path);
+        } catch (Exception e) {
+            System.out.println("此服务已存在");
+        }
+    }
+
+    // 地址 -> XXX.XXX.XXX.XXX:port 字符串
+    private String getServiceAddress(InetSocketAddress serverAddress) {
+        return serverAddress.getHostName() +
+                ":" +                    
+                serverAddress.getPort();
+    }
+    // 字符串解析为地址
+    private InetSocketAddress parseAddress(String address) {
+        String[] result = address.split(":");
+        return new InetSocketAddress(result[0], Integer.parseInt(result[1]));
+    }
+}
+
+```
+
+
+
+### 永久节点与临时节点
+
+在使用 **Zookeeper** 作为注册中心时，永久节点和临时节点有各自的作用。两者的配合能够更好地实现服务注册和发现。
+
+#### **1. 永久节点的作用**
+
+- **概念**：
+
+  - 永久节点（`PERSISTENT`）一旦创建，就会一直存在，除非手动删除。
+  - 不会因服务端下线或断开连接而自动删除。
+
+- **在服务注册中的作用**：
+
+  1. **存储服务名称**：
+
+     - 永久节点通常用于表示一个服务的逻辑名称，例如 `/MyRPC/UserService`。
+     - 服务名称是长期存在的，即使所有服务实例都暂时不可用，服务的逻辑概念仍然保留。
+
+  2. **提供目录结构**：
+
+     - 永久节点可以作为服务实例临时节点的父节点，充当目录作用，便于组织和管理。
+
+     - 示例结构：
+
+       ```
+       /MyRPC
+           /UserService  <-- 永久节点
+               /192.168.1.100:8080  <-- 临时节点
+               /192.168.1.101:8081  <-- 临时节点
+       ```
+
+- **优势**：
+
+  - 即使当前所有服务实例都下线，永久节点仍然存在，方便客户端知道这个服务名并尝试发现新的实例。
+  - 减少重复创建服务名节点的开销。
+
+#### 2. 临时节点的作用
+
+- **概念**：
+  - 临时节点（`EPHEMERAL`）与客户端的会话绑定。当会话断开或服务端下线时，临时节点会自动删除。
+
+- **在服务注册中的作用**：
+  1. **动态服务实例管理**：
+     - 每个服务实例对应一个临时节点，例如 `/MyRPC/UserService/192.168.1.100:8080`。
+     - 当服务实例下线时，节点会自动删除，确保客户端不再连接到已不可用的服务。
+  2. **实时服务状态更新**：
+     - 临时节点的自动删除机制可以保证注册中心的服务信息实时更新，避免使用无效地址。
+
+- **优势**：
+  - 无需手动清理下线服务实例的节点。
+  - 实现了服务实例的动态注册与注销。
+
+##### **永久节点与临时节点的配合**
+
+通过永久节点和临时节点的组合，可以同时满足 **服务长期存在的稳定性** 和 **服务实例动态管理的灵活性**。
+
+#### **示例：服务注册与发现**
+
+1. **服务端注册服务**：
+   - 创建服务名的永久节点 `/MyRPC/UserService`。
+   - 为每个服务实例创建临时节点 `/MyRPC/UserService/192.168.1.100:8080`。
+
+2. **服务实例下线**：
+   - 当服务端 192.168.1.100:8080 下线时，对应的临时节点 `/MyRPC/UserService/192.168.1.100:8080` 会自动删除。
+   - 永久节点 `/MyRPC/UserService` 不受影响。
+
+3. **客户端服务发现**：
+   - 客户端通过查询永久节点 `/MyRPC/UserService`，获取其子节点列表（服务实例地址）。
+   - 如果没有子节点，表示当前没有可用的服务实例，但服务逻辑名仍然存在，客户端可尝试重新发现。
+
+#### **总结**
+
+- **永久节点** 保证了服务的逻辑存在，不会因为所有服务实例下线而丢失。
+- **临时节点** 动态反映服务实例的状态，自动删除无效服务，减少管理开销。
+
+这种设计兼顾了 **服务的长期性** 和 **实例的动态性**，同时实现了服务注册与发现的高效管理。
+
+### 测试函数
+
+```java
+package com.async.rpc.server;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/15
+ */
+
+import com.async.rpc.common.server.UserService;
+import com.async.rpc.common.server.impl.UserServiceImpl;
+import com.async.rpc.server.provider.ServiceProvider;
+import com.async.rpc.server.server.RpcServer;
+import com.async.rpc.server.server.impl.NettyRpcServerImpl;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: 使用ZK注册中心的测试类
+ **/
+public class TestZKServer {
+    public static void main(String[] args) {
+        UserService userService=new UserServiceImpl();
+        // 需要提供服务网络地址（本机），用于服务注册
+        ServiceProvider serviceProvider=new ServiceProvider("127.0.0.1",9999);
+        serviceProvider.provideServiceInterface(userService);
+
+        RpcServer rpcServer=new NettyRpcServerImpl(serviceProvider);
+        rpcServer.start(9999);
+    }
+}
+```
+
+### **服务注册的整体流程**
+
+服务注册是分布式系统中服务端向注册中心报告自身服务信息的过程，客户端可通过注册中心动态发现服务实例并与其通信。在这里，我们结合 Zookeeper 和相关代码讲解整个服务注册流程。
+
+#### **流程概述**
+
+1. **服务端启动时注册服务**：
+   - 服务端将提供的服务（例如 `UserService`）及其网络地址（`IP:Port`）注册到 Zookeeper。
+   - 服务端在 Zookeeper 上创建一个永久节点（服务名）和多个临时节点（服务实例地址）。
+
+2. **服务端下线时自动注销服务**：
+   - Zookeeper 自动删除服务实例的临时节点，保证注册中心信息的实时性。
+
+3. **客户端动态发现服务**：
+   - 客户端从注册中心查询服务名，获取当前可用的服务实例地址（`IP:Port`），并与服务端建立通信。
+
+#### **代码逻辑和调用流程**
+
+##### **1. 服务端启动服务并注册**
+
+##### **入口：`TestZKServer.main()`**
+
+```java
+public static void main(String[] args) {
+    // 初始化服务实现类
+    UserService userService = new UserServiceImpl();
+
+    // 初始化服务注册器（ServiceProvider），传入服务端的 IP 和端口
+    ServiceProvider serviceProvider = new ServiceProvider("127.0.0.1", 9999);
+
+    // 注册服务
+    serviceProvider.provideServiceInterface(userService);
+
+    // 启动服务端并监听端口
+    RpcServer rpcServer = new NettyRpcServerImpl(serviceProvider);
+    rpcServer.start(9999);
+}
+```
+
+1. **初始化服务实现类**：
+   - 创建服务逻辑实现类对象（如 `UserServiceImpl`）。
+   - 这是服务端提供的业务逻辑，服务端需要将其注册到注册中心。
+
+2. **注册服务**：
+   - 调用 `ServiceProvider.provideServiceInterface`，将服务注册到本地存储和 Zookeeper 注册中心。
+
+3. **启动服务端**：
+   - 服务端开始监听端口，等待客户端请求。
+
+##### **2. 注册服务到本地和 Zookeeper**
+
+##### **类：`ServiceProvider`**
+
+```java
+public void provideServiceInterface(Object service) {
+    // 获取服务类名（实现类）
+    String serviceName = service.getClass().getName();
+
+    // 获取服务实现类所实现的所有接口
+    Class<?>[] interfaceName = service.getClass().getInterfaces();
+
+    // 遍历接口列表
+    for (Class<?> clazz : interfaceName) {
+        // 将接口名和服务实例对象存储到本地映射
+        interfaceProvider.put(clazz.getName(), service);
+
+        // 注册服务到 Zookeeper
+        serviceRegister.register(clazz.getName(), new InetSocketAddress(host, port));
+    }
+}
+```
+
+- **本地注册服务**：
+  - 使用 `interfaceProvider` 存储服务接口名和对应的服务实例对象。
+  - 供服务端处理请求时，通过接口名快速找到对应的服务实现类。
+
+- **注册到 Zookeeper**：
+  - 调用 `serviceRegister.register`：
+    1. 创建服务名节点（永久节点）。
+    2. 创建服务实例节点（临时节点），保存服务端的 `IP:Port`。
+
+##### **3. 服务实例注册到 Zookeeper**
+
+##### **类：`ZKServiceRegister`**
+
+```java
+@Override
+public void register(String serviceName, InetSocketAddress serviceAddress) {
+    try {
+        // 检查服务名节点是否存在
+        if (client.checkExists().forPath("/" + serviceName) == null) {
+            // 创建永久节点（服务名）
+            client.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT)
+                .forPath("/" + serviceName);
+        }
+
+        // 创建临时节点（服务实例地址）
+        String path = "/" + serviceName + "/" + getServiceAddress(serviceAddress);
+        client.create().creatingParentsIfNeeded().withMode(CreateMode.EPHEMERAL)
+            .forPath(path);
+    } catch (Exception e) {
+        System.out.println("此服务已存在");
+    }
+}
+```
+
+1. **创建服务名节点（永久节点）**：
+   - 每个服务名（例如 `/UserService`）只会创建一次，代表服务的逻辑存在。
+
+2. **创建服务实例节点（临时节点）**：
+   - 每个服务实例（例如 `/UserService/127.0.0.1:9999`）为一个临时节点。
+   - 当服务端下线或断开连接时，节点会自动删除。
+
+##### **4. 服务端启动监听**
+
+##### **类：`RpcServer`**
+
+```java
+public void start(int port) {
+    ServerSocket serverSocket = new ServerSocket(port);
+    while (true) {
+        Socket socket = serverSocket.accept();
+        new Thread(new WorkThread(socket, serviceProvider)).start();
+    }
+}
+```
+
+- 启动服务端监听，接受客户端连接。
+- 每个连接由一个独立线程 `WorkThread` 处理，线程通过 `ServiceProvider` 查找对应服务并处理业务逻辑。
+
+##### **服务注册节点结构**
+
+假设服务端注册了 `UserService`，IP 为 `127.0.0.1`，端口为 `9999`。
+
+**Zookeeper 节点结构：**
+
+```
+/MyRPC
+    /UserService           <-- 永久节点
+        /127.0.0.1:9999    <-- 临时节点
+```
+
+- **永久节点**：
+  - `/MyRPC/UserService` 表示服务的逻辑名称。
+  - 不会随服务端下线而删除。
+
+- **临时节点**：
+  - `/MyRPC/UserService/127.0.0.1:9999` 表示具体的服务实例。
+  - 服务端下线时，节点自动删除，保证客户端不连接无效服务。
+
+#### **整体流程图**
+
+```plaintext
+1. 服务端启动服务（TestZKServer.main）
+    -> 初始化服务实现类 (UserServiceImpl)
+    -> 初始化服务提供器 (ServiceProvider)
+    -> 调用 provideServiceInterface:
+        - 本地存储服务接口和实现类
+        - 调用 ZKServiceRegister.register:
+            -> 创建永久节点 (UserService)
+            -> 创建临时节点 (127.0.0.1:9999)
+
+2. 服务端启动监听
+    -> RpcServer.start
+    -> 等待客户端请求
+
+3. 服务实例下线
+    -> Zookeeper 自动删除临时节点
+```
+
+#### **总结**
+
+- 服务注册的整体流程分为三部分：
+  1. **本地存储**：将服务接口名和实现类映射到本地，用于服务端快速查找服务实例。
+  2. **Zookeeper 注册**：将服务名和实例地址注册到 Zookeeper，供客户端动态发现。
+  3. **动态管理**：通过 Zookeeper 临时节点机制，实现服务实例的动态管理（上线/下线）。
+
+- 该流程保证了分布式服务的灵活性和实时性，使客户端能够动态适配服务端的变化。
 
