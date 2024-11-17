@@ -1,6 +1,10 @@
 package com.async.rpc.server.netty.nettyInitializer;
 
 
+import com.async.rpc.client.netty.handler.NettyClientHandler;
+import com.async.rpc.common.serializer.myCoder.MyDecoder;
+import com.async.rpc.common.serializer.myCoder.MyEncoder;
+import com.async.rpc.common.serializer.mySerializer.JsonSerializer;
 import com.async.rpc.server.netty.handler.NettyRPCServerHandler;
 import com.async.rpc.server.provider.ServiceProvider;
 import io.netty.channel.ChannelInitializer;
@@ -19,6 +23,27 @@ import lombok.AllArgsConstructor;
  * @github crypt0walker
  * @date 2024/11/8
  */
+
+@AllArgsConstructor
+public class NettyServerInitializer extends ChannelInitializer<SocketChannel> {
+    private ServiceProvider serviceProvider;  // 服务提供者，用于注册和管理本地服务实例
+
+    @Override
+    protected void initChannel(SocketChannel ch) throws Exception {
+        ChannelPipeline pipeline = ch.pipeline();  // 获取当前通道的处理器链
+
+        // 添加编码器：将服务端生成的 RpcResponse 对象编码为字节流
+        pipeline.addLast(new MyEncoder(new JsonSerializer()));
+
+        // 添加解码器：将接收到的字节流解码为 RpcRequest 对象
+        pipeline.addLast(new MyDecoder());
+
+        // 添加服务端业务逻辑处理器：处理客户端请求，调用本地服务并返回结果
+        pipeline.addLast(new NettyRPCServerHandler(serviceProvider));
+    }
+}
+
+/* 原有利用Java原生序列化器，配合加入长度字段解决沾包问题
 @AllArgsConstructor
 public class NettyServerInitializer extends ChannelInitializer<SocketChannel> {
     private ServiceProvider serviceProvider;
@@ -45,3 +70,4 @@ public class NettyServerInitializer extends ChannelInitializer<SocketChannel> {
         pipeline.addLast(new NettyRPCServerHandler(serviceProvider));
     }
 }
+ */

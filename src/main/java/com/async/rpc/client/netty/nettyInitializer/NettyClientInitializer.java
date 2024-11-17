@@ -6,6 +6,10 @@ package com.async.rpc.client.netty.nettyInitializer;
  */
 
 import com.async.rpc.client.netty.handler.NettyClientHandler;
+import com.async.rpc.common.serializer.myCoder.MyDecoder;
+import com.async.rpc.common.serializer.myCoder.MyEncoder;
+import com.async.rpc.common.serializer.mySerializer.JsonSerializer;
+import com.async.rpc.server.provider.ServiceProvider;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.socket.SocketChannel;
@@ -14,6 +18,7 @@ import io.netty.handler.codec.LengthFieldPrepender;
 import io.netty.handler.codec.serialization.ClassResolver;
 import io.netty.handler.codec.serialization.ObjectDecoder;
 import io.netty.handler.codec.serialization.ObjectEncoder;
+import lombok.AllArgsConstructor;
 
 /**
  * @program: simple_RPC
@@ -21,6 +26,26 @@ import io.netty.handler.codec.serialization.ObjectEncoder;
  * @description: 配置netty对消息的处理机制，如编码器、解码器、消息格式等（设置handler）
  *
  **/
+
+public class NettyClientInitializer extends ChannelInitializer<SocketChannel> {
+    private ServiceProvider serviceProvider;  // 服务提供者，用于注册和管理本地服务实例
+
+    @Override
+    protected void initChannel(SocketChannel ch) throws Exception {
+        ChannelPipeline pipeline = ch.pipeline();  // 获取当前通道的处理器链（管道）
+
+        // 添加解码器：将字节流解码为 RpcRequest 或 RpcResponse 对象
+        pipeline.addLast(new MyDecoder());
+
+        // 添加编码器：将 RpcRequest 或 RpcResponse 对象编码为字节流，使用 JsonSerializer 序列化
+        pipeline.addLast(new MyEncoder(new JsonSerializer()));
+
+        // 添加客户端业务逻辑处理器：处理从服务端接收的响应
+        pipeline.addLast(new NettyClientHandler());
+    }
+}
+
+/* 原有使用Java原生序列化器，添加一个长度字段解码器，解决 TCP 粘包/拆包问题
 public class NettyClientInitializer extends ChannelInitializer<SocketChannel> {
     @Override
     // 初始化通道并配置处理器链
@@ -58,3 +83,5 @@ public class NettyClientInitializer extends ChannelInitializer<SocketChannel> {
         pipeline.addLast(new NettyClientHandler());
     }
 }
+
+ */

@@ -5,8 +5,10 @@ package com.async.rpc.common.message;
  * @date 2024/11/3
  */
 
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 import java.io.Serializable;
 
@@ -15,7 +17,8 @@ import java.io.Serializable;
  *
  * @description: Rpc的请求消息格式
  **/
-
+@NoArgsConstructor
+@AllArgsConstructor
 @Data
 @Builder
 public class RpcRequest implements Serializable {

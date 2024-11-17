@@ -5,7 +5,8 @@
 - 构建一个基本的RPC调用——√
 - 引入Netty网络应用框架——√
 - 引入Zookeeper作为服务注册中心——√
-- Netty自定义编码器、解码器及序列化器，实现json、protobuf序列化方式——待完成
+- Netty自定义编码器、解码器及序列化器，实现jsonf序列化方式——√
+- 增加其它序列化方式——×
 - 客户端建立本地服务缓存并实现动态更新——待完成
 - ……
 
@@ -1953,4 +1954,620 @@ public void start(int port) {
   3. **动态管理**：通过 Zookeeper 临时节点机制，实现服务实例的动态管理（上线/下线）。
 
 - 该流程保证了分布式服务的灵活性和实时性，使客户端能够动态适配服务端的变化。
+
+# 4. 自定义编解码器与序列化
+
+## 4.1 原理知识
+
+### 为什么需要使用 **Netty 自定义编解码器和序列化器**
+
+在基于 **Netty** 的 RPC 框架中，编解码器和序列化器的设计直接影响到 **数据传输的效率**、**兼容性** 和 **灵活性**。使用自定义编解码器和序列化器能够满足特定的需求和优化性能。
+
+#### **1. 编解码器的作用**
+
+**编解码器** 是用于在数据传输过程中将高层协议数据转换为底层传输格式（编码），以及将接收到的底层数据恢复为高层协议数据（解码）的工具。
+
+在 RPC 场景中，客户端和服务端需要通过网络传递 **请求对象（`RpcRequest`）** 和 **响应对象（`RpcResponse`）**。
+
+- **编码器（Encoder）**：
+  - 将 Java 对象转换为字节流，以便通过 Netty 发送。
+- **解码器（Decoder）**：
+  - 将接收到的字节流还原为 Java 对象，供应用逻辑处理。
+
+#### **2. 为什么需要自定义编解码器**
+
+Netty 提供了一些内置的编解码工具（如 `ObjectEncoder` 和 `ObjectDecoder`），虽然简单易用，但存在以下局限性：
+
+**1. 默认序列化方式效率低**
+
+- 默认使用 Java 原生序列化（`ObjectInputStream` 和 `ObjectOutputStream`），性能较差，序列化后的数据较大。
+- 不能满足高性能的 RPC 框架需求。
+
+**2. 格式不灵活，难以与其他语言兼容**
+
+- Java 原生序列化方式是专为 Java 设计的，无法与其他语言的客户端或服务端进行通信。
+
+**3. 数据传输容易出现粘包/拆包问题**
+
+- TCP 是流式协议，数据传输时容易出现多个消息被拼接或分拆的问题。自定义编解码器可以通过消息头部添加长度字段来解决。
+
+**4. 无法支持多种序列化格式**
+
+- 不支持其他更高效的序列化方式（如 JSON、Protobuf、Avro 等）。自定义编解码器可以为不同格式提供支持。
+
+#### **3. 序列化器的作用**
+
+**序列化器** 是编解码器的核心，用于将对象转换为字节数组（序列化），以及将字节数组还原为对象（反序列化）。
+
+##### **为什么需要自定义序列化器**
+
+1. **支持多种序列化协议**：
+   - 可以灵活切换序列化方式（如 JSON、Protobuf、Avro 等），提升扩展性和兼容性。
+2. **优化性能**：
+   - 采用更高效的序列化协议（如 Protobuf）以减少序列化时间和传输数据大小。
+3. **跨语言支持**：
+   - 使用如 JSON 或 Protobuf 的序列化方式，可以实现 Java 与其他语言（如 Python、Go 等）之间的通信。
+
+#### **4. 简单来说为什么需要自定义编解码器**
+
+通过自定义编解码器和序列化器，可以实现：
+
+1. **高性能**：
+   - 替换原生序列化，支持更高效的协议（如 Protobuf、Avro）。
+2. **灵活性**：
+   - 编解码器可以对消息增加额外信息（如消息长度、校验码等），便于数据传输和解析。
+3. **跨语言兼容**：
+   - 使用 JSON 或 Protobuf 支持多语言通信。
+4. **解决粘包/拆包问题**：
+   - 在编码时添加消息长度字段，解码时依据长度字段分离消息。
+
+#### **总结**
+
+在 RPC 框架中，使用 Netty 自定义编解码器和序列化器是为了：
+
+1. 提升数据传输效率（通过优化序列化方式）。
+2. 提供更强的扩展性（支持多种序列化协议）。
+3. 保证数据传输的完整性和正确性（通过长度字段解决粘包/拆包问题）。
+4. 支持跨语言通信。
+
+通过自定义设计，编解码器可以完美适配实际需求，提供高效的 RPC 通信能力。
+
+### 编解码器和序列化的关系
+
+在分布式系统中，**编解码器** 和 **序列化** 是网络通信中两个密切相关的概念。两者在数据传输中扮演不同但相辅相成的角色。
+
+- **编解码器** 是消息整体传输协议的一部分，负责处理消息的结构（如长度字段、校验码等）。
+- **序列化器** 是编解码器的工具，专注于对象与字节流之间的转换。
+- 两者的关系：
+  - **编解码器调用序列化器完成核心数据的序列化与反序列化**。
+- 分离的好处：
+  - 提升模块化设计的灵活性和扩展性。
+  - 适应多种序列化协议和复杂的网络传输场景。
+
+## 4.2 自定义解码器与编码器
+
+### netty中的重要组件
+
+**ChannelHandler 与 ChannelPipeline** ChannelHandler 是对 Channel 中数据的处理器，这些处理器可以是系统本身定义好的编解码器，也可以是用户自定义的。这些处理器会被统一添加到一个 ChannelPipeline 的对象中，然后按照添加的类别对 Channel 中的数据进行依次处理。
+
+在上一节中，我们使用netty自带的编码器和解码器 来实现数据的传输
+
+而在这里，我们可以通过**继承netty提供的基类**，实现自定义的编码器和解码器
+
+在common包下建立serializer包，实现自定义编码器，解码器和序列化器
+
+### MessageType
+
+#### 概述
+
+`MessageType` 是一个 **枚举类**，用于定义消息的类型。在 RPC 框架中，它用来区分消息是请求类型（`RpcRequest`）还是响应类型（`RpcResponse`）。
+
+通过这种方式，可以为每种消息分配一个唯一的整数编码（`code`），便于在网络通信中传递和解析消息类型。
+
+#### 代码
+
+```java
+package com.async.rpc.common.message;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/17
+ */
+
+import lombok.AllArgsConstructor;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: 指定消息的数据类型
+ **/
+@AllArgsConstructor
+public enum MessageType {
+    REQUEST(0),RESPONSE(1);
+    private int code;
+    public int getCode(){
+        return code;
+    }
+}
+```
+
+#### 总结
+
+**MessageType 的意义**：
+
+- 定义了消息类型（请求和响应）以及其对应的整数编码。
+- 提供统一的消息类型管理，提升代码的可读性和可维护性。
+
+**优点**：
+
+- 避免硬编码数字常量（如 `0`、`1`），改用枚举使代码更具可读性。
+- 枚举类型的类型安全性降低了误用的可能性。
+
+
+
+
+
+### 自定义编码器myEncoder
+
+#### **概述**
+
+`MyEncoder` 是一个自定义的 **Netty 编码器**，继承自 `MessageToByteEncoder`，用于将高层数据（如 `RpcRequest` 和 `RpcResponse`）编码成字节流，以便在网络上传输。编码时，它将以下信息顺序写入到 `ByteBuf` 中：
+
+1. 消息类型
+2. 序列化方式
+3. 数据长度
+4. 序列化后的数据
+
+#### 代码
+
+```java
+/**
+ * @program: simple_RPC
+ *
+ * @description: 自定义编码器
+ **/
+@AllArgsConstructor
+public class MyEncoder extends MessageToByteEncoder {
+    //MessageToByteEncoder--Netty提供的编码器基类，用于将消息对象编码为字节流。
+    //其子类需要实现 encode() 方法完成具体编码逻辑。
+    private Serializer serializer;
+    @Override
+    //Netty 在发送消息时会自动调用encode方法。
+    //ctx：当前通道的上下文，用于管理通道相关的资源。
+    //msg：要编码的消息对象（如 RpcRequest 或 RpcResponse）。
+    //out：Netty 提供的 ByteBuf，用于存储编码后的字节数据。
+    protected void encode(ChannelHandlerContext ctx, Object msg, ByteBuf out) throws Exception {
+        System.out.println(msg.getClass());
+        //1.写入消息类型，用于区分是请求（RpcRequest）还是响应（RpcResponse）。
+        // MessageType 是一个枚举，包含请求和响应的类型码。
+        if(msg instanceof RpcRequest){
+            out.writeShort(MessageType.REQUEST.getCode());
+        }
+        else if(msg instanceof RpcResponse){
+            out.writeShort(MessageType.RESPONSE.getCode());
+        }
+        //2.写入序列化方式，目的是写入序列化方式的类型码，用于客户端和服务端解析消息时知道使用何种序列化方式
+        // out.writeShort：将序列化方式（2 字节）写入 ByteBuf。
+        // serializer.getType()：返回当前序列化器的类型（例如：JSON、Protobuf）。
+        out.writeShort(serializer.getType());
+        // 得到序列化数组
+        // serializer.serialize(msg)：将消息对象序列化为字节数组。
+        byte[] serializeBytes = serializer.serialize(msg);
+        //3.写入数据长度，用于接收端知道需要读取多少字节。
+        // out.writeInt(): 将数据长度（4 字节）写入 ByteBuf。
+        out.writeInt(serializeBytes.length);
+        //4.写入实际的序列化数据，作为消息的主体内容。
+        //out.writeBytes():将字节数组的内容逐字节写入 ByteBuf。
+        out.writeBytes(serializeBytes);
+    }
+}
+```
+
+#### **完整的数据格式**
+
+最终编码后的数据在 `ByteBuf` 中的结构为：
+
+| 字段           | 字节数 | 描述                                              |
+| -------------- | ------ | ------------------------------------------------- |
+| **消息类型**   | 2 字节 | 区分请求（`RpcRequest`）和响应（`RpcResponse`）。 |
+| **序列化方式** | 2 字节 | 指定序列化器类型（如 JSON、Protobuf）。           |
+| **数据长度**   | 4 字节 | 指定实际数据的字节长度。                          |
+| **序列化数据** | 不固定 | 具体的序列化字节数组。                            |
+
+#### **总结**
+
+1. **功能概览**：
+   - `MyEncoder` 将高层对象（`RpcRequest` 或 `RpcResponse`）编码为适合网络传输的字节流。
+   - 通过消息类型、序列化方式和数据长度，保证接收端可以正确解析消息。
+2. **关键点**：
+   - 写入消息类型用于区分请求和响应。
+   - 写入序列化方式支持多种序列化协议。
+   - 写入数据长度解决 TCP 粘包/拆包问题。
+3. **扩展性**：
+   - 编码器与序列化器解耦，支持灵活更换序列化方式。
+   - 新增消息类型时只需修改 `MessageType` 枚举即可。
+
+### 自定义解码器myDecoder
+
+#### **概述**
+
+`MyDecoder` 是一个自定义的 **Netty 解码器**，继承自 `ByteToMessageDecoder`，用于将接收到的字节流解析为高层对象（如 `RpcRequest` 和 `RpcResponse`）。在解码过程中：
+
+1. 按顺序解析消息类型、序列化方式、数据长度和具体数据。
+2. 根据解析结果恢复为相应的 Java 对象。
+
+#### 代码
+
+```java
+package com.async.rpc.common.serializer.myCoder;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/17
+ */
+
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.ByteToMessageDecoder;
+import com.async.rpc.common.message.MessageType;
+import java.util.List;
+import com.async.rpc.common.serializer.mySerializer.Serializer;
+/**
+ * @program: simple_RPC
+ *
+ * @description: 自定义解码器,按照自定义的消息格式解码数据
+ **/
+//ByteToMessageDecoder:Netty 提供的解码器基类，用于将字节流解析为 Java 对象。
+public class MyDecoder extends ByteToMessageDecoder {
+    //decode() 方法完成具体解码逻辑。
+    @Override
+    //channelHandlerContext：通道上下文，管理通道的生命周期和资源。
+    //in：Netty 提供的 ByteBuf，表示接收到的数据缓冲区。
+    //out：存储解码后的对象，解码完成后会传递给后续的处理器。
+    protected void decode(ChannelHandlerContext channelHandlerContext, ByteBuf in, List<Object> out) throws Exception {
+        //1.读取消息类型例如：REQUEST还是RESPONSE
+        short messageType = in.readShort();
+        // 现在还只支持request与response请求
+        if(messageType != MessageType.REQUEST.getCode() &&
+                messageType != MessageType.RESPONSE.getCode()){
+            System.out.println("暂不支持此种数据");
+            return;
+        }
+        //2.读取序列化的方式&类型
+        // 从缓冲区中读取消息类型（2 字节），判断是请求（RpcRequest）还是响应（RpcResponse）。
+        short serializerType = in.readShort();
+        // 通过消息类型，获取对应的序列化器（如 JSON、Protobuf）。
+        Serializer serializer = Serializer.getSerializerByCode(serializerType);
+        if(serializer == null)
+            throw new RuntimeException("不存在对应的序列化器");
+        //3.读取序列化数组长度（4 字节），用于确定需要读取的字节数。
+        // 如果长度信息不完整，ByteToMessageDecoder 会自动等待更多数据到达。
+        int length = in.readInt();
+        //4.读取序列化数组
+        byte[] bytes=new byte[length];
+        // 从缓冲区中读取指定长度的字节数据，作为序列化后的数据内容。
+        // 将 length 个字节读取到 bytes 数组中。
+        in.readBytes(bytes);
+        // 使用对应的序列化器将字节数组解析为 Java 对象（如 RpcRequest 或 RpcResponse）。
+        Object deserialize= serializer.deserialize(bytes, messageType);
+        // 将解码后的对象添加到 out 列表中，供后续处理器使用。
+        out.add(deserialize);
+    }
+}
+```
+
+
+
+#### **完整流程总结**
+
+1. **读取消息类型**：
+   - 判断是请求还是响应，确保支持的消息类型。
+2. **读取序列化方式**：
+   - 动态获取序列化器实例，用于解析后续的数据。
+3. **读取数据长度**：
+   - 确定需要读取的字节数，避免数据不完整。
+4. **读取序列化数据**：
+   - 获取字节数组，作为序列化后的数据内容。
+5. **反序列化为对象**：
+   - 使用序列化器将字节数组还原为 Java 对象，并传递给后续处理器。
+
+#### **扩展点**
+
+- 支持更多消息类型：
+  - 扩展 `MessageType` 枚举，支持心跳消息、错误消息等。
+- 多种序列化方式：
+  - 增加序列化器类型（如 Kryo、Avro），提升性能。
+- 优化错误处理：
+  - 针对不支持的消息类型和序列化器提供更清晰的异常提示。
+
+
+
+## 4.3 自定义序列化器
+
+### 4.3.1 自定义Json序列化器
+
+#### 概述
+
+`JsonSerializer` 是实现了 `Serializer` 接口的序列化器，用于将对象与字节数组之间进行转换。该类使用 **FastJSON** 作为序列化工具，并根据消息类型（`messageType`）对不同类型的消息（`RpcRequest` 或 `RpcResponse`）进行特殊处理
+
+#### 代码
+
+```java
+package com.async.rpc.common.serializer.mySerializer;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/17
+ */
+
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONObject;
+import com.async.rpc.common.message.RpcRequest;
+import com.async.rpc.common.message.RpcResponse;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: Json格式的序列化器
+ **/
+public class JsonSerializer implements Serializer {
+    //在对象与字节数组之间序列化与反序列化，以便通过网络传输。
+    @Override
+    public byte[] serialize(Object obj) {
+        //使用 FastJSON 将对象转换为 JSON 字符串并序列化为字节数组。
+        byte[] bytes = JSONObject.toJSONBytes(obj);
+        return bytes;
+    }
+    // 根据消息类型 messageType，将字节数组反序列化为对应的对象（RpcRequest 或 RpcResponse）。
+    @Override
+    public Object deserialize(byte[] bytes, int messageType) {
+        Object obj = null;
+        // 传输的消息分为request与response
+        switch (messageType){
+            case 0://messageType是request，将字节数组解析为RPCRequest对象
+                RpcRequest request = JSON.parseObject(bytes, RpcRequest.class);
+                //初始化 objects 数组，用于存储解析后的参数。
+                Object[] objects = new Object[request.getParams().length];
+                // 把json字串转化成对应的对象， fastjson可以读出基本数据类型，不用转化
+                // 对转换后的request中的params属性逐个进行类型判断
+                //遍历请求参数（params），逐一校验其实际类型是否与参数类型数组（paramsType）中的类型一致。
+                for(int i = 0; i < objects.length; i++){
+                    Class<?> paramsType = request.getParamsType()[i];
+                    //判断每个对象类型是否和paramsTypes中的一致
+                    //使用 isAssignableFrom 检查参数的实际类型是否可以赋值给目标类型。（判断一个类是否是另一个类的父类或接口。）
+                    if (!paramsType.isAssignableFrom(request.getParams()[i].getClass())){
+                        //如果不一致，就行进行类型转换
+                        // 将数据强转为JSONObject吼用fastjson提供的方法将其转为目标类型。
+                        objects[i] = JSONObject.toJavaObject((JSONObject) request.getParams()[i],request.getParamsType()[i]);
+                    }else{
+                        //如果一致就直接赋给objects[i]
+                        objects[i] = request.getParams()[i];
+                    }
+                }
+                request.setParams(objects);
+                obj = request;
+                break;
+            case 1://messageType是response，使用 FastJSON 将字节数组解析为 RpcResponse 对象。
+                RpcResponse response = JSON.parseObject(bytes, RpcResponse.class);
+                Class<?> dataType = response.getDataType();
+                //判断转化后的response对象中的data的类型是否正确
+                if(! dataType.isAssignableFrom(response.getData().getClass())){
+                    response.setData(JSONObject.toJavaObject((JSONObject) response.getData(),dataType));
+                }
+                obj = response;
+                break;
+            default:
+                System.out.println("暂时不支持此种消息");
+                throw new RuntimeException();
+        }
+        return obj;
+    }
+    //1 代表json序列化方式
+    @Override
+    public int getType() {
+        return 1;
+    }
+}
+```
+
+这段代码中的类型转换逻辑主要针对方法参数，分为两种情况：
+
+1. **基本数据类型**：  
+   - 如 `int`, `float`, `boolean` 等，FastJSON 会自动解析为对应的基本数据类型或其包装类（如 `Integer`）。  
+   - **无需转换**，直接赋值即可。
+
+2. **引用类型**：  
+   - 对于非基本数据类型（如自定义类、集合类型），FastJSON 默认解析为通用类型（如 `JSONObject`）。  
+   - 如果实际类型与目标类型不一致，则通过 `toJavaObject` 将 `JSONObject` 转换为目标类型。
+
+**代码逻辑**：  
+
+- 遍历参数，检查实际类型和目标类型是否一致：  
+  - **一致**：直接赋值。  
+  - **不一致**：使用 `toJavaObject` 转换为目标类型。  
+
+这样确保了参数类型与方法签名一致，支持复杂参数的动态类型处理。
+
+同时需要在RPCResponse中补充：
+
+```java
+//更新：加入传输数据的类型，以便在自定义序列化器中解析
+private Class<?> dataType;
+```
+
+### 4.3.2 原生Java序列化器
+
+这个类实现了 `Serializer` 接口，使用 Java 原生序列化机制实现了对象和字节数组之间的相互转换。
+
+```java
+package com.async.rpc.common.serializer.mySerializer;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/17
+ */
+
+import java.io.*;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: Java原生的序列化器
+ **/
+public class ObjectSerializer implements Serializer {
+    //利用Java io 对象 -》字节数组
+    @Override
+    public byte[] serialize(Object obj) {
+        byte[] bytes=null;// 用于存储序列化后的字节数组
+        ByteArrayOutputStream bos=new ByteArrayOutputStream();// 用于存储字节数据的缓冲区
+        try {
+            //是一个对象输出流，用于将 Java 对象序列化为字节流，并将其连接到bos上
+            ObjectOutputStream oos = new ObjectOutputStream(bos);
+            oos.writeObject(obj);
+            //刷新 ObjectOutputStream，确保所有缓冲区中的数据都被写入到底层流中。
+            oos.flush();
+            //将bos其内部缓冲区中的数据转换为字节数组
+            bytes = bos.toByteArray();
+            oos.close();
+            bos.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return bytes;
+    }
+
+    //字节数组 -》对象
+    @Override
+    public Object deserialize(byte[] bytes, int messageType) {
+        Object obj = null;
+        ByteArrayInputStream bis = new ByteArrayInputStream(bytes);
+        try {
+            ObjectInputStream ois = new ObjectInputStream(bis);
+            obj = ois.readObject();
+            ois.close();
+            bis.close();
+        } catch (IOException | ClassNotFoundException e) {
+            e.printStackTrace();
+        }
+        return obj;
+    }
+
+    //0 代表Java 原生序列器
+    @Override
+    public int getType() {
+        return 0;
+    }
+}
+```
+
+
+
+### 4.3.3 自定义protobuf序列化器
+
+略
+
+**如果希望支持动态切换：**
+
+此点作为优化项，还要优化序列化器的动态选择，在 `NettyClientInitializer` 和 `NettyServerInitializer` 中不需要直接指定序列化器，而是依赖消息中携带的 `serializerType`。
+
+- 在 `RpcRequest` 或 `RpcResponse` 消息中加入一个字段 `serializerType`，表示序列化方式。
+- 客户端发送消息时，将序列化器类型标记为 `JSON` 或 `Java`。
+- 服务端解码时，根据 `serializerType` 动态选择对应的序列化器进行反序列化。
+
+在原代码中采用了
+
+**静态配置，代码直接指定**：
+
+- 在 NettyClientInitializer和 NettyServerInitializer中硬编码序列化器实例，例如：
+
+  ```java
+  javaCopy codepipeline.addLast(new MyEncoder(new JsonSerializer()));
+  pipeline.addLast(new MyDecoder());
+  ```
+
+### 4.3.4 更改NettyInitializer 
+
+下述代码是客户端和服务端初始化 Netty 通信管道（`ChannelPipeline`）的实现，主要目的是设置数据传输过程中使用的处理器（Handler），包括自定义的编码器、解码器和业务逻辑处理器。
+
+#### NettyClientInitializer 
+
+```java
+public class NettyClientInitializer extends ChannelInitializer<SocketChannel> {
+    private ServiceProvider serviceProvider;  // 服务提供者，用于注册和管理本地服务实例
+
+    @Override
+    protected void initChannel(SocketChannel ch) throws Exception {
+        ChannelPipeline pipeline = ch.pipeline();  // 获取当前通道的处理器链（管道）
+
+        // 添加解码器：将字节流解码为 RpcRequest 或 RpcResponse 对象
+        pipeline.addLast(new MyDecoder());
+
+        // 添加编码器：将 RpcRequest 或 RpcResponse 对象编码为字节流，使用 JsonSerializer 序列化
+        pipeline.addLast(new MyEncoder(new JsonSerializer()));
+        
+        // 添加客户端业务逻辑处理器：处理从服务端接收的响应
+        pipeline.addLast(new NettyClientHandler());
+    }
+}
+```
+
+#### NettyServerInitializer 
+
+```java
+@AllArgsConstructor
+public class NettyServerInitializer extends ChannelInitializer<SocketChannel> {
+    private ServiceProvider serviceProvider;  // 服务提供者，用于注册和管理本地服务实例
+
+    @Override
+    protected void initChannel(SocketChannel ch) throws Exception {
+        ChannelPipeline pipeline = ch.pipeline();  // 获取当前通道的处理器链
+        
+        // 添加编码器：将服务端生成的 RpcResponse 对象编码为字节流
+        pipeline.addLast(new MyEncoder(new JsonSerializer()));
+        
+        // 添加解码器：将接收到的字节流解码为 RpcRequest 对象
+        pipeline.addLast(new MyDecoder());
+        
+        // 添加服务端业务逻辑处理器：处理客户端请求，调用本地服务并返回结果
+        pipeline.addLast(new NettyRPCServerHandler(serviceProvider));
+    }
+}
+
+```
+
+记得还要更新message中的RpcResponse里的dataType
+
+```java
+//定义返回信息格式RpcResponse（类似http格式）
+@NoArgsConstructor
+@AllArgsConstructor
+@Data
+@Builder
+public class RpcResponse implements Serializable {
+    //状态码
+    private int code;
+    //状态信息
+    private String message;
+    //具体数据
+    private Object data;
+    //更新：加入传输数据的类型，以便在自定义序列化器中解析
+    private Class<?> dataType;
+    //构造成功信息
+    public static RpcResponse sussess(Object data) {
+        RpcResponse response = RpcResponse.builder()
+                .code(200)
+                .data(data)
+                //增加了数据类型后更新
+                .dataType(data != null ? data.getClass() : null) // 设置返回数据类型
+                .build();
+        return response;
+    }
+    //构造失败信息
+    public static RpcResponse fail(){
+        return RpcResponse.builder().code(500).message("服务器发生错误").build();
+    }
+}
+```
+
+
 
