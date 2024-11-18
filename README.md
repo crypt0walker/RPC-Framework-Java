@@ -2571,3 +2571,165 @@ public class RpcResponse implements Serializable {
 
 
 
+# 5. 客户端建立本地服务缓存并实现动态更新
+
+现有的本地服务缓存机制存在一个比较大的问题，那就是本地服务缓存和Zookeeper服务的数据一致性问题。如果采用经典的旁路缓存策略（cache aside）：首先在本地缓存中读，读不到再去zk更新。就会存在诸多问题，如：服务更新了一个新地址，而原地址已经在本地缓存中，一直可用，那么新配置的服务地址就一直未被启用，不能做到负载均衡；
+
+这个问题和其它的数据一致性问题，如Redis缓存和后端关系型数据库之间的数据一致性问题，大体相同但是又有一定区别；总结而言，区别是：Redis和关系型数据库之间的配合，所有客户端都需要先和Redis做交互，而本地缓存的zk中心的不同点在于，新服务提供者直接向zk中心注册服务（写操作），而不需要经过本地缓存；所以这个问题和传统的本地缓存和云端服务器一致性问题是差不多的。最简单的方式是轮询更新，我们这里用到比轮询更好的方式，那就是使用zookeeper的watcher机制来做服务的订阅更新。其实这就是设计模式中观察者模式在此处的应用。同样，它也类似与redis与数据库之间用消息队列来通知更新最新数据的模式，而其实zk中其实也用到了消息队列kafka（最新没有）。下
+
+此处本项目的解决方案就是——使用zookeeper的watcher机制来做事件监听；
+
+### 5.1 事件监听机制
+
+#### **watcher概念**
+
+- `zookeeper`提供了数据的`发布/订阅`功能，多个订阅者可同时监听某一特定主题对象，当该主题对象的自身状态发生变化时例如节点内容改变、节点下的子节点列表改变等，会实时、主动通知所有订阅者
+- `zookeeper`采用了 `Watcher`机制实现数据的发布订阅功能。该机制在被订阅对象发生变化时会异步通知客户端，因此客户端不必在 `Watcher`注册后轮询阻塞，从而减轻了客户端压力
+- `watcher`机制事件上与观察者模式类似，也可看作是一种观察者模式在分布式场景下的实现方式
+
+#### watcher架构
+
+`watcher`实现由三个部分组成
+
+- `zookeeper`服务端
+- `zookeeper`客户端
+- 客户端的`ZKWatchManager对象`
+
+客户端**首先将 `Watcher`注册到服务端**，同时将 `Watcher`对象**保存到客户端的`watch`管理器中**。当`Zookeeper`服务端监听的数据状态发生变化时，服务端会**主动通知客户端**，接着客户端的 `Watch`管理器会**触发相关 `Watcher`**来回调相应处理逻辑，从而完成整体的数据 `发布/订阅`流程
+
+![image-20241118200512778](./assets/image-20241118200512778.png)
+
+## 5.2 **watchZK 监听zookeeper的实现**
+
+代码功能：创建与zk间的连接，利用监听器监控zk路径下的事件发生，根据事件发生类型更新本地缓冲中的服务列表。
+
+```java
+package com.async.rpc.client.serviceCenter.ZKWatcher;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/18
+ */
+
+import com.async.rpc.client.cache.serviceCache;
+import org.apache.curator.framework.CuratorFramework;
+import org.apache.curator.framework.recipes.cache.ChildData;
+import org.apache.curator.framework.recipes.cache.CuratorCache;
+import org.apache.curator.framework.recipes.cache.CuratorCacheListener;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: 监听ZK的节点更新
+ **/
+public class watchZK {
+    // curator 提供的zookeeper客户端
+    private CuratorFramework client;
+    //本地缓存
+    serviceCache cache;
+
+    public watchZK(CuratorFramework client,serviceCache  cache){
+        this.client=client;
+        this.cache=cache;
+    }
+
+    /**
+     * 监听当前节点和子节点的 更新，创建，删除
+     * @param path
+     */
+    public void watchToUpdate(String path) throws InterruptedException {
+        CuratorCache curatorCache = CuratorCache.build(client, "/");
+        curatorCache.listenable().addListener(new CuratorCacheListener() {
+            @Override
+            public void event(Type type, ChildData childData, ChildData childData1) {
+                // 第一个参数：事件类型（枚举）
+                // 第二个参数：节点更新前的状态、数据
+                // 第三个参数：节点更新后的状态、数据
+                // 创建节点时：节点刚被创建，不存在 更新前节点 ，所以第二个参数为 null
+                // 删除节点时：节点被删除，不存在 更新后节点 ，所以第三个参数为 null
+                // 节点创建时没有赋予值 create /curator/app1 只创建节点，在这种情况下，更新前节点的 data 为 null，获取不到更新前节点的数据
+                switch (type.name()) {
+                    case "NODE_CREATED": // 监听器第一次执行时节点存在也会触发次事件
+                        //获取更新的节点的路径
+                        String path=new String(childData1.getPath());
+                        //按照格式 ，读取
+                        String[] pathList= path.split("/");
+                        if(pathList.length<=2) break;
+                        else {
+                            String serviceName=pathList[1];
+                            String address=pathList[2];
+                            //将新注册的服务加入到本地缓存中
+                            cache.addServcieToCache(serviceName,address);
+                        }
+                        break;
+                    case "NODE_CHANGED": // 节点更新
+                        if (childData.getData() != null) {
+                            System.out.println("修改前的数据: " + new String(childData.getData()));
+                        } else {
+                            System.out.println("节点第一次赋值!");
+                        }
+                        System.out.println("修改后的数据: " + new String(childData1.getData()));
+                        break;
+                    case "NODE_DELETED": // 节点删除
+                        String path_d=new String(childData.getPath());
+                        //按照格式 ，读取
+                        String[] pathList_d= path_d.split("/");
+                        if(pathList_d.length<=2) break;
+                        else {
+                            String serviceName=pathList_d[1];
+                            String address=pathList_d[2];
+                            //将新注册的服务加入到本地缓存中
+                            cache.delete(serviceName,address);
+                        }
+                        break;
+                    default:
+                        break;
+                }
+            }
+        });
+        //开启监听
+        curatorCache.start();
+    }
+}
+```
+
+## 5.3 **在ZKServiceCenter 加入缓存和监听器**
+
+更改ZKServiceCenter中的服务发现serviceDiscovery方法，增加本地缓存的查找逻辑，找不到再去zk服务器中找（其实只有初次启动会执行并在zk中找到，因为如果监听器正常，那么后续的更新都会通知到本地缓存，后续本地缓存中没有的，zk中也没有）：
+
+```java
+    //服务发现方法
+    //向zk注册中心发起查询，根据服务名（接口名）返回地址
+    @Override
+    public InetSocketAddress serviceDiscovery(String serviceName) {
+        try {
+            //新增的本地缓存，先从本地缓存中找
+            List<String> serviceList=cache.getServcieFromCache(serviceName);
+            //如果找不到，再去zookeeper中找
+            // 获取 Zookeeper 中指定服务名称的子节点列表
+            //客户端通过服务名 serviceName 向 Zookeeper 查询注册的服务实例列表。
+            //本地缓存更新版本：如果本地服务列表为空，则向zk查询，返回结果是一个服务实例的地址列表（如 192.168.1.100:8080）。
+            if(serviceList==null){
+                serviceList = client.getChildren().forPath("/" + serviceName);
+            }
+//            List<String> serviceList = client.getChildren().forPath("/" + serviceName);
+
+            // 检查列表是否为空——如果不检查若列表为空，后续get(0)则会报异常
+            if (serviceList == null || serviceList.isEmpty()) {
+                System.err.println("No available instances for service: " + serviceName);
+                return null; // 或者你可以抛出一个自定义的异常来告知调用者
+            }
+
+            // 选择一个服务实例，默认用第一个节点，后续可以加入负载均衡机制
+            String string = serviceList.get(0);
+
+            // 解析并返回 InetSocketAddress
+            // 将字符串形式的地址（如 192.168.1.100:8080）转换为 InetSocketAddress，便于后续网络连接。
+            return parseAddress(string);
+        } catch (Exception e) {
+            e.printStackTrace(); // 打印异常堆栈
+            return null; // 或者根据需求返回一个默认的 InetSocketAddress
+        }
+    }
+```
+

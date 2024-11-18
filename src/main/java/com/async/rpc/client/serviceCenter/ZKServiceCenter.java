@@ -5,6 +5,8 @@ package com.async.rpc.client.serviceCenter;
  * @date 2024/11/15
  */
 
+import com.async.rpc.client.cache.serviceCache;
+import com.async.rpc.client.serviceCenter.ZKWatcher.watchZK;
 import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
@@ -23,7 +25,8 @@ public class ZKServiceCenter implements ServiceCenter {
     private CuratorFramework client;
     //定义 Zookeeper 中的根节点路径，所有的服务都注册在这个路径下。
     private static final String ROOT_PATH = "MyRPC";
-
+    //serviceCache，新增的本地服务缓存
+    private serviceCache cache;
     //构造函数：负责zookeeper客户端的初始化，并与zookeeper服务端进行连接
     public ZKServiceCenter(){
         // 创建重试策略：指数退避重试
@@ -40,25 +43,44 @@ public class ZKServiceCenter implements ServiceCenter {
                 .build();
         this.client.start();
         System.out.println("zookeeper 连接成功");
+        // 更新内容：本地缓存动态更新的初始化
+        //初始化本地缓存
+        cache=new serviceCache();
+        //加入zookeeper事件监听器
+        watchZK watcher=new watchZK(client,cache);
+        System.out.println("zookeeper事件监听器加入成功");
+        //监听启动
+        try {
+            watcher.watchToUpdate(ROOT_PATH);
+            System.out.println("监听器初始化更新成功");
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }
     }
     //服务发现方法
     //向zk注册中心发起查询，根据服务名（接口名）返回地址
     @Override
     public InetSocketAddress serviceDiscovery(String serviceName) {
         try {
+            //新增的本地缓存，先从本地缓存中找
+            List<String> serviceList=cache.getServcieFromCache(serviceName);
+            //如果找不到，再去zookeeper中找
             // 获取 Zookeeper 中指定服务名称的子节点列表
             //客户端通过服务名 serviceName 向 Zookeeper 查询注册的服务实例列表。
-            //返回结果是一个服务实例的地址（如 192.168.1.100:8080）。
-            List<String> strings = client.getChildren().forPath("/" + serviceName);
+            //本地缓存更新版本：如果本地服务列表为空，则向zk查询，返回结果是一个服务实例的地址列表（如 192.168.1.100:8080）。
+            if(serviceList==null){
+                serviceList = client.getChildren().forPath("/" + serviceName);
+            }
+//            List<String> serviceList = client.getChildren().forPath("/" + serviceName);
 
             // 检查列表是否为空——如果不检查若列表为空，后续get(0)则会报异常
-            if (strings == null || strings.isEmpty()) {
+            if (serviceList == null || serviceList.isEmpty()) {
                 System.err.println("No available instances for service: " + serviceName);
                 return null; // 或者你可以抛出一个自定义的异常来告知调用者
             }
 
             // 选择一个服务实例，默认用第一个节点，后续可以加入负载均衡机制
-            String string = strings.get(0);
+            String string = serviceList.get(0);
 
             // 解析并返回 InetSocketAddress
             // 将字符串形式的地址（如 192.168.1.100:8080）转换为 InetSocketAddress，便于后续网络连接。
