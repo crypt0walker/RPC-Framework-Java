@@ -7,6 +7,7 @@ package com.async.rpc.client.serviceCenter;
 
 import com.async.rpc.client.cache.serviceCache;
 import com.async.rpc.client.serviceCenter.ZKWatcher.watchZK;
+import com.async.rpc.client.serviceCenter.balance.impl.ConsistencyHashBalance;
 import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
@@ -80,11 +81,12 @@ public class ZKServiceCenter implements ServiceCenter {
             }
 
             // 选择一个服务实例，默认用第一个节点，后续可以加入负载均衡机制
-            String string = serviceList.get(0);
-
+//            String address = serviceList.get(0);
+            // 负载均衡机制选择节点
+            String address =  new ConsistencyHashBalance().balance(serviceList);
             // 解析并返回 InetSocketAddress
             // 将字符串形式的地址（如 192.168.1.100:8080）转换为 InetSocketAddress，便于后续网络连接。
-            return parseAddress(string);
+            return parseAddress(address);
         } catch (Exception e) {
             e.printStackTrace(); // 打印异常堆栈
             return null; // 或者根据需求返回一个默认的 InetSocketAddress

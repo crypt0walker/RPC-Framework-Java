@@ -6,9 +6,12 @@
 - 引入Netty网络应用框架——√
 - 引入Zookeeper作为服务注册中心——√
 - Netty自定义编码器、解码器及序列化器，实现jsonf序列化方式——√
-- 增加其它序列化方式——×
+- 增加其它序列化方式——待完成
 - 客户端建立本地服务缓存并实现动态更新——√
-- ……
+- 多种负载均衡机制的实现（随机、轮询、一致性哈希）——√
+- 超时重试与白名单机制——待完成
+- 服务限流与降级机制——待完成
+- 服务熔断机制——待完成
 
 # 1. 实现一个基本的RPC调用
 
@@ -2733,3 +2736,457 @@ public class watchZK {
     }
 ```
 
+# 6. 负载均衡策略添加
+
+## 6.1 负载均衡算法介绍
+
+参见[JavaGuide](https://javaguide.cn/high-performance/load-balancing.html)对于此部分的介绍，内容包括负载均衡算法是什么，几种类型负载均衡，具体的负载均衡算法，DNS解析与反向代理；
+
+## 6.2 负载均衡代码实现（传输层）
+
+### LoadBalance接口
+
+简介：LoadBalance接口定义负载均衡算法需要实现的方法，其中addNode和RemoveNode其实是为了适应一致性哈希算法
+
+```java
+package com.async.rpc.client.serviceCenter.balance;
+
+import java.util.List;
+
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/19
+ * 配置服务地址列表，根据负载均衡策略选择相应节点
+ */
+public interface LoadBalance {
+    String balance(List<String> address);
+    void addNode(String node);
+    void removeNode(String node);
+}
+```
+
+### 随机算法——RandomLoadBalance
+
+简介：利用Ramdom的随机数生成器生成列表节点的随机下标并返回
+
+```java
+package com.async.rpc.client.serviceCenter.balance.impl;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/19
+ */
+
+import com.async.rpc.client.serviceCenter.balance.LoadBalance;
+
+import java.util.List;
+import java.util.Random;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: 随机访问负载均衡算法
+ **/
+public class RandomLoadBalance implements LoadBalance {
+    @Override
+    public String balance(List<String> addressList) {
+        //构建随机数生成器
+        Random random = new Random();
+        //随机选择列表内的一个节点
+        int choose = random.nextInt(addressList.size());
+        System.out.println("负载均衡选择了" + choose + "号服务器");
+        return addressList.get(choose); // 注意：这里应该返回选中的地址，而不是null
+    }
+
+    // 这些方法在随机算法中不需要特殊实现，因为每次选择都是独立的
+    public void addNode(String node) {}
+
+    @Override
+    public void removeNode(String node) {
+
+    }
+}
+```
+
+### 轮询算法——RoundLoadBalance
+
+简介：维护一个int类型的choose值，记录上次选择的服务器索引，循环取余选择服务器。
+
+```java
+package com.async.rpc.client.serviceCenter.balance.impl;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/19
+ */
+
+import com.async.rpc.client.serviceCenter.balance.LoadBalance;
+
+import java.util.List;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: 轮询负载均衡算法
+ **/
+public class RoundLoadBalance implements LoadBalance {
+    private int choose = -1; // 用于记录上一次选择的服务器索引
+
+    @Override
+    public String balance(List<String> addressList) {
+        choose++;
+        choose = choose % addressList.size(); // 循环选择
+        System.out.println("负载均衡选择了" + choose + "号服务器");
+        return addressList.get(choose);
+    }
+
+    // 这些方法在简单轮询算法中不需要特殊实现
+    public void addNode(String node) {}
+    public void removeNode(String node) {}
+}
+```
+
+### 一致性哈希算法——ConsistencyHashBalance
+
+简介：和哈希法类似，一致性 Hash 法也可以让相同参数的请求总是发到同一台服务器处理。不过，它解决了哈希法存在的一些问题。
+
+常规哈希法在服务器数量变化时，哈希值会重新落在不同的服务器上，这明显违背了使用哈希法的本意。而一致性哈希法的核心思想是将数据和节点都映射到一个哈希环上，然后根据哈希值的顺序来确定数据属于哪个节点。当服务器增加或删除时，只影响该服务器的哈希，而不会导致整个服务集群的哈希键值重新分布。其外其中定义了虚拟节点可用于动态调整真实节点的负载权重。
+
+```java
+package com.async.rpc.client.serviceCenter.balance.impl;
+/**
+ * @author async
+ * @github crypt0walker
+ * @date 2024/11/19
+ */
+
+import com.async.rpc.client.serviceCenter.balance.LoadBalance;
+
+import java.util.*;
+
+/**
+ * @program: simple_RPC
+ *
+ * @description: 一致性哈希负载均衡算法
+ **/
+public class ConsistencyHashBalance implements LoadBalance {
+    // 虚拟节点是一致性哈希负载均衡算法中用于控制负载均衡的工具，通过将一个实际服务器配置为多个虚拟节点，
+    // 可以使得哈希更加均衡，并且可以更具虚拟节点的分配个数调整实际服务器的负载权重。
+    // 虚拟节点的个数，增加虚拟节点可以使得负载分配更均匀
+    private static final int VIRTUAL_NUM = 5;
+
+    // 虚拟节点分配，key是hash值，value是虚拟节点服务器名称
+    private static SortedMap<Integer, String> shards = new TreeMap<>();
+
+    // 真实节点列表
+    private static List<String> realNodes = new LinkedList<>();
+
+    // 初始化方法，将真实服务器添加到哈希环上
+    private  void init(List<String> serviceList) {
+        // 遍历添加真实节点对应的虚拟节点值shards
+        for (String server :serviceList) {
+            realNodes.add(server);
+            System.out.println("真实节点[" + server + "] 被添加");
+            for (int i = 0; i < VIRTUAL_NUM; i++) {
+                // 命名空间
+                String virtualNode = server + "&&VN" + i;
+                int hash = getHash(virtualNode);
+                shards.put(hash, virtualNode);
+                System.out.println("虚拟节点[" + virtualNode + "] hash:" + hash + "，被添加");
+            }
+        }
+    }
+
+    // 根据输入的key选择服务器
+    public String getServer(String node, List<String> serviceList) {
+        init(serviceList);
+        int hash = getHash(node);
+        // 如果hash值大于哈希环上的最大值，则返回哈希环上的第一个节点
+        if (!shards.containsKey(hash)) {
+            SortedMap<Integer, String> tailMap = shards.tailMap(hash);
+            hash = tailMap.isEmpty() ? shards.firstKey() : tailMap.firstKey();
+        }
+        return shards.get(hash).split("&&")[0]; // 返回真实节点名称
+    }
+
+    // 添加真实节点对应的虚拟节点
+    public void addNode(String node) {
+        if (!realNodes.contains(node)) {
+            realNodes.add(node);
+            System.out.println("真实节点[" + node + "] 上线添加");
+            for (int i = 0; i < VIRTUAL_NUM; i++) {
+                String virtualNode = node + "&&VN" + i;
+                int hash = getHash(virtualNode);
+                // 向虚拟节点map中添加VIRTUAL_NUM个虚拟节点
+                shards.put(hash, virtualNode);
+                System.out.println("虚拟节点[" + virtualNode + "] hash:" + hash + "，被添加");
+            }
+        }
+    }
+
+    // 将一个真实节点所对应的虚拟节点删除
+    public void removeNode(String node) {
+        if (realNodes.contains(node)) {
+            realNodes.remove(node);
+            System.out.println("真实节点[" + node + "] 下线移除");
+            for (int i = 0; i < VIRTUAL_NUM; i++) {
+                String virtualNode = node + "&&VN" + i;
+                int hash = getHash(virtualNode);
+                shards.remove(hash);
+                System.out.println("虚拟节点[" + virtualNode + "] hash:" + hash + "，被移除");
+            }
+        }
+    }
+
+    // 使用FNV1_32_HASH算法计算哈希值
+    private static int getHash(String str) {
+        final int p = 16777619;
+        int hash = (int) 2166136261L;
+        for (int i = 0; i < str.length(); i++)
+            hash = (hash ^ str.charAt(i)) * p;
+        hash += hash << 13;
+        hash ^= hash >> 7;
+        hash += hash << 3;
+        hash ^= hash >> 17;
+        hash += hash << 5;
+        // 如果算出来的值为负数则取其绝对值
+        if (hash < 0)
+            hash = Math.abs(hash);
+        return hash;
+    }
+
+    @Override
+    public String balance(List<String> addressList) {
+        // 使用UUID作为随机key，确保负载均衡
+        String random = UUID.randomUUID().toString();
+        return getServer(random, addressList);
+    }
+}
+```
+
+#### 代码解析
+
+```java
+public String getServer(String node, List<String> serviceList) {
+    init(serviceList);
+    int hash = getHash(node);
+    // 如果hash值大于哈希环上的最大值，则返回哈希环上的第一个节点
+    if (!shards.containsKey(hash)) {
+        SortedMap<Integer, String> tailMap = shards.tailMap(hash);
+        hash = tailMap.isEmpty() ? shards.firstKey() : tailMap.firstKey();
+    }
+    return shards.get(hash).split("&&")[0]; // 返回真实节点名称
+}
+```
+
+让我们逐步分解这个方法：
+
+1. `init(serviceList)`: 
+   这一步确保所有服务器节点都被添加到哈希环上。
+
+2. `int hash = getHash(node)`: 
+   计算输入key（在这里是`node`）的哈希值。这个哈希值决定了在哈希环上的位置。
+
+3. `if (!shards.containsKey(hash))`: 
+   检查是否有服务器节点的哈希值与输入key的哈希值完全匹配。通常情况下，不会有完全匹配。
+
+4. 如果没有完全匹配：
+
+   ```java
+   SortedMap<Integer, String> tailMap = shards.tailMap(hash);
+   hash = tailMap.isEmpty() ? shards.firstKey() : tailMap.firstKey();
+   ```
+
+   - `shards.tailMap(hash)` 返回一个子Map，包含所有大于或等于`hash`的条目。
+   - 如果`tailMap`不为空，我们选择其中的第一个key（即大于或等于`hash`的最小值）。
+   - 如果`tailMap`为空（意味着`hash`大于哈希环上的所有值），我们选择`shards`中的第一个key，实现了环的"wrap around"。
+
+5. `return shards.get(hash).split("&&")[0]`: 
+   返回选中的服务器节点名称。由于我们使用"realNode&&VNx"格式存储虚拟节点，需要分割字符串来获取真实节点名称。
+
+#### 一致性哈希的核心原理
+
+这段代码体现了一致性哈希的几个关键原则：
+
+1. **环形结构**：通过在到达最大值时回到最小值，实现了哈希环的概念。
+
+2. **顺时针查找**：代码实现了在哈希环上顺时针查找最近的服务器节点。
+
+3. **负载分散**：通过将请求映射到哈希环上，然后找到最近的服务器，实现了负载的分散。
+
+4. **虚拟节点**：虽然在这段代码中不直接体现，但通过`split("&&")[0]`可以看出使用了虚拟节点的概念。
+
+#### 为什么这样做？
+
+- **灵活性**：这种方法允许动态添加或移除服务器节点，而只影响哈希环上相邻的一小部分区域。
+- **均衡性**：通过虚拟节点（在其他部分的代码中实现），可以使负载更均匀地分布在所有服务器上。
+- **确定性**：对于同一个key，总是会选择同一个服务器（除非有节点添加或移除），这对于某些应用场景很重要。
+
+理解这段代码和背后的原理，对于掌握一致性哈希算法及其在负载均衡中的应用至关重要。
+
+#### 一致性哈希算法中的虚拟节点
+
+虚拟节点是一致性哈希算法中的一个重要概念，它的引入主要是为了解决负载不均衡的问题。让我详细解释一下虚拟节点的作用：
+
+1. 提高负载均衡性：
+   在没有虚拟节点的情况下，如果只有少量的实际服务器节点，它们在哈希环上的分布可能会不均匀，导致某些服务器承担过多的负载，而其他服务器则相对空闲。通过引入虚拟节点，每个实际服务器在哈希环上都会有多个映射点，这样可以使得负载更加均匀地分布。
+
+2. 减少数据倾斜：
+   当服务器数量较少时，可能会出现大部分请求都映射到了同一个服务器上的情况。虚拟节点通过增加每个服务器在哈希环上的分布点，降低了这种数据倾斜的可能性。
+
+3. 提高可扩展性：
+   当添加或删除服务器时，虚拟节点可以帮助更平滑地重新分配负载。因为每个实际服务器对应多个虚拟节点，所以添加或删除一个服务器只会影响哈希环上的一小部分区域，而不是造成大范围的负载重分配。
+
+4. 灵活调整负载：
+   通过调整每个实际服务器对应的虚拟节点数量，可以灵活地控制每个服务器承担的负载比例。例如，性能较高的服务器可以配置更多的虚拟节点，从而承担更多的请求。
+
+在代码中，虚拟节点是这样实现的：
+
+```java
+private static final int VIRTUAL_NUM = 5;
+
+public void addNode(String node) {
+    if (!realNodes.contains(node)) {
+        realNodes.add(node);
+        for (int i = 0; i < VIRTUAL_NUM; i++) {
+            String virtualNode = node + "&&VN" + i;
+            int hash = getHash(virtualNode);
+            shards.put(hash, virtualNode);
+        }
+    }
+}
+```
+
+这里，每个实际节点都会创建 `VIRTUAL_NUM`（在这个例子中是5）个虚拟节点。每个虚拟节点都有自己的哈希值，并被放置在哈希环上的不同位置。
+
+虚拟节点的命名通常是实际节点名称加上某种标识，如 `"&&VN" + i`。这样可以保证虚拟节点的唯一性，同时又能方便地找到它对应的实际节点。
+
+使用虚拟节点后，即使只有少量的实际服务器，在哈希环上也会有大量的分布点，这大大增加了负载均衡的效果。例如，如果有3个实际服务器，每个服务器有5个虚拟节点，那么在哈希环上就会有15个分布点，这比只有3个分布点的情况要均匀得多。
+
+总的来说，虚拟节点是一种简单而有效的方法，可以在不增加实际服务器数量的情况下，显著提高一致性哈希算法的负载均衡效果和系统的可扩展性。
+
+### ServiceCenter中使用负载均衡
+
+```java
+    //服务发现方法
+    //向zk注册中心发起查询，根据服务名（接口名）返回地址
+    @Override
+    public InetSocketAddress serviceDiscovery(String serviceName) {
+        try {
+            //新增的本地缓存，先从本地缓存中找
+            List<String> serviceList=cache.getServcieFromCache(serviceName);
+            //如果找不到，再去zookeeper中找
+            // 获取 Zookeeper 中指定服务名称的子节点列表
+            //客户端通过服务名 serviceName 向 Zookeeper 查询注册的服务实例列表。
+            //本地缓存更新版本：如果本地服务列表为空，则向zk查询，返回结果是一个服务实例的地址列表（如 192.168.1.100:8080）。
+            if(serviceList==null){
+                serviceList = client.getChildren().forPath("/" + serviceName);
+            }
+//            List<String> serviceList = client.getChildren().forPath("/" + serviceName);
+
+            // 检查列表是否为空——如果不检查若列表为空，后续get(0)则会报异常
+            if (serviceList == null || serviceList.isEmpty()) {
+                System.err.println("No available instances for service: " + serviceName);
+                return null; // 或者你可以抛出一个自定义的异常来告知调用者
+            }
+
+            // 选择一个服务实例，默认用第一个节点，后续可以加入负载均衡机制
+//            String address = serviceList.get(0);
+            // 负载均衡机制选择节点
+            String address =  new ConsistencyHashBalance().balance(serviceList);
+            // 解析并返回 InetSocketAddress
+            // 将字符串形式的地址（如 192.168.1.100:8080）转换为 InetSocketAddress，便于后续网络连接。
+            return parseAddress(address);
+        } catch (Exception e) {
+            e.printStackTrace(); // 打印异常堆栈
+            return null; // 或者根据需求返回一个默认的 InetSocketAddress
+        }
+    }
+```
+
+## 6.3 深度思考与优化：负载均衡算法
+
+### 1. LRU与负载均衡
+
+#### 1.1 LRU作为负载均衡算法的适用性
+
+LRU（Least Recently Used）算法本身并不适合直接作为负载均衡的实现。主要原因如下：
+
+- 目标不同：LRU主要用于缓存管理，而负载均衡旨在分配请求。
+- 考虑因素不同：LRU只考虑访问时间，而负载均衡需要考虑服务器的处理能力、当前负载等多个因素。
+- 可能导致负载不均：仅基于最近访问时间可能会导致某些服务器长期不被访问，造成资源浪费。
+
+#### 1.2 LRU思想在负载均衡中的应用
+
+尽管LRU不直接适用于负载均衡，但其思想可以被借鉴：
+
+1. 时间戳策略：为每个服务器维护一个"最近访问时间戳"，选择最久未被访问的服务器处理新请求。
+2. 结合其他因素：将访问时间作为负载均衡算法的一个考虑因素，而不是唯一依据。
+3. 动态调整权重：根据服务器的访问频率动态调整其在负载均衡中的权重。
+
+#### 1.3 LRU在项目中的价值
+
+虽然LRU不适合直接用作负载均衡算法，但将其纳入项目描述仍有价值：
+
+1. 展示算法知识：LRU是常见的算法题，可以展示你的算法实现能力。
+2. 引导讨论：可能引导面试官询问LRU的实现或与其他算法的比较。
+3. 思维拓展：展示了你能够从不同角度思考问题，尝试将不同领域的概念应用到负载均衡中。
+
+### 2. 处理不均衡的服务器能力
+
+#### 2.1 利用一致性哈希算法
+
+一致性哈希算法通过虚拟节点的概念为处理不均衡的服务器能力提供了解决方案：
+
+1. 虚拟节点映射：每个实际服务器节点映射到多个虚拟节点。
+2. 动态调整：根据服务器的处理能力调整其虚拟节点的数量。
+3. 概率控制：虚拟节点数量直接影响服务器接收请求的概率。
+
+#### 2.2 实现步骤
+
+1. 服务器能力注册：在注册中心记录每个服务器的负载能力。
+2. 客户端获取信息：负载均衡时从注册中心获取服务器能力信息。
+3. 动态设置虚拟节点：根据服务器能力动态调整虚拟节点数量。
+4. 请求分发：基于调整后的虚拟节点分布进行负载均衡。
+
+### 3. 自适应负载均衡
+
+#### 3.1 核心思想
+
+自适应负载均衡旨在根据服务节点的实时表现动态调整流量分配，主要包括：
+
+1. 实时监控：持续收集服务节点的性能指标。
+2. 动态评分：基于多维度指标对服务节点进行评分。
+3. 自动调整：根据评分结果动态调整流量分配比例。
+
+#### 3.2 实现方法
+
+##### 3.2.1 指标收集
+
+收集的指标可能包括：
+
+- 响应时间
+- 处理能力（QPS）
+- CPU使用率
+- 内存使用情况
+- 网络吞吐量
+
+##### 3.2.2 评分策略
+
+1. 设置指标权重：为每个指标分配权重。
+2. 计算综合得分：根据各指标的实际值和权重计算总分。
+3. 定期更新：定期重新计算分数以反映最新状态。
+
+##### 3.2.3 流量控制
+
+1. 结合一致性哈希：使用一致性哈希作为基础负载均衡策略。
+2. 动态调整虚拟节点：根据服务节点的评分动态调整其虚拟节点数量。
+3. 平滑过渡：设置调整的最小间隔和最大幅度，避免剧烈波动。
+
+#### 3.3 优化考虑
+
+1. 历史数据权重：考虑历史表现，避免短期波动造成的过度调整。
+2. 预警机制：设置阈值，当节点评分过低时触发警报。
+3. 自动恢复：当节点恢复正常后，逐步增加其负载。
+4. 反馈循环：持续监控调整后的效果，进行进一步优化。
