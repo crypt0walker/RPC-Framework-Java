@@ -8,6 +8,7 @@ package com.async.rpc.client.serviceCenter.balance.impl;
 import com.async.rpc.client.serviceCenter.balance.LoadBalance;
 
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * @program: simple_RPC
@@ -23,11 +24,21 @@ public class ConsistencyHashBalance implements LoadBalance {
     // 虚拟节点分配，key是hash值，value是虚拟节点服务器名称
     private static SortedMap<Integer, String> shards = new TreeMap<>();
 
+//    // 真实节点列表
+//    private static List<String> realNodes = new LinkedList<>();
     // 真实节点列表
-    private static List<String> realNodes = new LinkedList<>();
+    private static final List<String> realNodes = new CopyOnWriteArrayList<>(); // 使用线程安全的集合
 
     // 初始化方法，将真实服务器添加到哈希环上
     private  void init(List<String> serviceList) {
+        if (serviceList == null || serviceList.isEmpty()) {
+            throw new IllegalArgumentException("服务列表为空，无法初始化一致性哈希环");
+        }
+
+        // 避免重复初始化，清空现有的真实节点和虚拟节点
+        realNodes.clear();
+        shards.clear();
+
         // 遍历添加真实节点对应的虚拟节点值shards
         for (String server :serviceList) {
             realNodes.add(server);

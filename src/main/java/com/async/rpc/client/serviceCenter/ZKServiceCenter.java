@@ -62,6 +62,19 @@ public class ZKServiceCenter implements ServiceCenter {
     //向zk注册中心发起查询，根据服务名（接口名）返回地址
     @Override
     public InetSocketAddress serviceDiscovery(String serviceName) {
+        // 服务是否存在检查
+        List<String> instances;
+        try {
+            instances = client.getChildren().forPath("/" + serviceName);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+
+        if (instances == null || instances.isEmpty()) {
+            System.err.println("No available instances for service: " + serviceName);
+            return null;
+        }
         try {
             //新增的本地缓存，先从本地缓存中找
             List<String> serviceList=cache.getServcieFromCache(serviceName);
@@ -91,6 +104,25 @@ public class ZKServiceCenter implements ServiceCenter {
             e.printStackTrace(); // 打印异常堆栈
             return null; // 或者根据需求返回一个默认的 InetSocketAddress
         }
+    }
+    private static final String RETRY = "CanRetry";
+    @Override
+    public boolean checkRetry(String serviceName) {
+        boolean canRetry =false;
+        try {
+            //获取zookeeper中的Retry服务（白名单）
+            List<String> serviceList = client.getChildren().forPath("/" + RETRY);
+            for(String s:serviceList){
+                //如果列表中有该服务
+                if(s.equals(serviceName)){
+                    System.out.println("服务"+serviceName+"在白名单上，可进行重试");
+                    canRetry=true;
+                }
+            }
+        }catch (Exception e) {
+            e.printStackTrace();
+        }
+        return canRetry;
     }
 
     // 地址 -> XXX.XXX.XXX.XXX:port 字符串

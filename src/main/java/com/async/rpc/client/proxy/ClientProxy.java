@@ -6,11 +6,19 @@ package com.async.rpc.client.proxy;
  */
 
 import com.async.rpc.client.IOClient;
+import com.async.rpc.client.circuitBreaker.CircuitBreaker;
+import com.async.rpc.client.circuitBreaker.CircuitBreakerProvider;
+import com.async.rpc.client.retry.guavaRetry;
 import com.async.rpc.client.rpcClient.RpcClient;
 import com.async.rpc.client.rpcClient.impl.NettyRpcClient;
 import com.async.rpc.client.rpcClient.impl.SimpleSocketRpcCilent;
+import com.async.rpc.client.serviceCenter.ServiceCenter;
+import com.async.rpc.client.serviceCenter.ZKServiceCenter;
 import com.async.rpc.common.message.RpcRequest;
 import com.async.rpc.common.message.RpcResponse;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import lombok.AllArgsConstructor;
 
 import java.lang.reflect.InvocationHandler;
@@ -46,8 +54,12 @@ public class ClientProxy implements InvocationHandler {
     }
      */
     private RpcClient rpcClient;
-    public ClientProxy(){
-        rpcClient=new NettyRpcClient();
+    private ServiceCenter serviceCenter;
+    private CircuitBreakerProvider circuitBreakerProvider;
+    public ClientProxy() throws InterruptedException {
+        serviceCenter=new ZKServiceCenter();
+        rpcClient=new NettyRpcClient(serviceCenter);
+        circuitBreakerProvider=new CircuitBreakerProvider();
     }
 
 
@@ -59,8 +71,31 @@ public class ClientProxy implements InvocationHandler {
                 .interfaceName(method.getDeclaringClass().getName())
                 .methodName(method.getName())
                 .params(args).paramsType(method.getParameterTypes()).build();
-        //数据传输
-        RpcResponse response= rpcClient.sendRequest(request);
+        //获取熔断器
+        CircuitBreaker circuitBreaker=circuitBreakerProvider.getCircuitBreaker(method.getName());
+        //判断熔断器是否允许请求经过
+        if (!circuitBreaker.allowRequest()){
+            //这里可以针对熔断做特殊处理，返回特殊值
+            return null;
+        }
+        //数据传输，重试更新机制之后此处需要更改，放在后面
+//        RpcResponse response= rpcClient.sendRequest(request);
+        RpcResponse response;
+        //后续添加逻辑：为保持幂等性，只对白名单上的服务进行重试
+        if (serviceCenter.checkRetry(request.getInterfaceName())){
+            //调用retry框架进行重试操作
+            response=new guavaRetry().sendServiceWithRetry(request,rpcClient);
+        }else {
+            //只调用一次
+            response= rpcClient.sendRequest(request);
+        }
+        //记录response的状态，上报给熔断器
+        if (response.getCode() ==200){
+            circuitBreaker.recordSuccess();
+        }
+        if (response.getCode()==500){
+            circuitBreaker.recordFailure();
+        }
         return response.getData();
     }
     // 创建代理实例的方法

@@ -42,7 +42,7 @@ public class NettyRpcClient implements RpcClient {
      */
     // zookeeper版本：先去注册中心查找服务对应的ip和端口，再去连接对应服务器
     private ServiceCenter serviceCenter;
-    public NettyRpcClient(){
+    public NettyRpcClient(ServiceCenter serviceCenter){
         this.serviceCenter=new ZKServiceCenter();
     }
 
